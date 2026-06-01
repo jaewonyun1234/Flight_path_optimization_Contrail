@@ -1,0 +1,130 @@
+"""
+contrail_env — Synthetic environment for contrail-aware flight option selection.
+
+This is the FOUNDATION of the quantum-optimization project. It produces
+all the structures the quantum solvers (Pasqal, Xanadu) and the classical
+verifier (CP-SAT) consume:
+
+    - A planning region (AirspaceGrid)
+    - Ice-supersaturated rain zones (ISSRField)
+    - ATC sectors with capacities (SectorMap, Sector)
+    - Aircraft performance (Aircraft, LinearJetPerformance)
+    - Flights with baseline + alternative altitude profiles (Flight, AltitudeProfile)
+    - Scored options (EvaluatedOption)
+    - The conflict graph and QUBO matrix (QUBOInstance)
+
+USAGE PATTERN
+=============
+
+    from contrail_env import (
+        default_european_world,
+        build_random_flights, build_and_evaluate_flight,
+        build_conflict_graph, build_capacity_buckets,
+        assemble_qubo, brute_force_optimum,
+    )
+
+    # 1. Build the world (airspace + ISSRs + sectors)
+    world = default_european_world(seed=42)
+
+    # 2. Build flights and their options
+    flights = build_random_flights(n_flights=4, world=world, seed=42)
+    all_evals = []
+    for f in flights:
+        all_evals.extend(build_and_evaluate_flight(f, world))
+
+    # 3. Construct constraint structures
+    conflicts = build_conflict_graph(all_evals, world)
+    buckets   = build_capacity_buckets(all_evals, world)
+
+    # 4. Assemble the QUBO matrix
+    qubo = assemble_qubo(all_evals, conflicts, buckets)
+
+    # 5. Hand qubo.Q off to your solver (CP-SAT / Pasqal / Xanadu)
+    #    or brute-force for verification on small instances:
+    z_opt, cost_opt, energy_opt = brute_force_optimum(qubo, all_evals)
+"""
+
+# Units
+from .units import (
+    M_PER_FT, FT_PER_M, M_PER_NM, NM_PER_KM,
+    MS_PER_KT, KT_PER_MS, KM_PER_DEG_LAT,
+    fl_to_ft, ft_to_fl, fl_to_m, m_to_fl,
+    isa_temperature, speed_of_sound_ms, mach_to_ms, ms_to_mach,
+)
+
+# Synthetic ISSRs
+from .synthetic_issr import (
+    ISSRBlob, ISSRField,
+    random_issr_field, hand_placed_issr_field,
+    issr_area_coverage,
+)
+
+# Airspace
+from .airspace import (
+    AirspaceGrid, Sector, SectorMap,
+    uniform_sector_grid,
+    voxelize_trajectory, densify_waypoints,
+)
+
+# World
+from .world import World, default_european_world
+
+# Aircraft
+from .aircraft import (
+    AircraftPerformance, LinearJetPerformance, Aircraft, a320_like,
+)
+
+# Flight model
+from .flight import (
+    AltitudeSegment, AltitudeProfile, Flight,
+    available_fls,
+    build_baseline_profile, replace_segment_fl, shift_all_segments,
+    waypoints_for, evaluate_option, EvaluatedOption,
+)
+
+# Options
+from .options import (
+    OptionKind, OptionSpec,
+    enumerate_option_specs,
+    build_and_evaluate_flight, build_random_flights,
+)
+
+# QUBO
+from .qubo import (
+    ConflictEdge, CapacityBucket, QUBOInstance,
+    build_conflict_graph, build_capacity_buckets, assemble_qubo,
+    is_feasible, cost_of_assignment, brute_force_optimum,
+)
+
+__all__ = [
+    # Units
+    "M_PER_FT", "FT_PER_M", "M_PER_NM", "NM_PER_KM",
+    "MS_PER_KT", "KT_PER_MS", "KM_PER_DEG_LAT",
+    "fl_to_ft", "ft_to_fl", "fl_to_m", "m_to_fl",
+    "isa_temperature", "speed_of_sound_ms", "mach_to_ms", "ms_to_mach",
+    # ISSRs
+    "ISSRBlob", "ISSRField",
+    "random_issr_field", "hand_placed_issr_field",
+    "issr_area_coverage",
+    # Airspace
+    "AirspaceGrid", "Sector", "SectorMap",
+    "uniform_sector_grid",
+    "voxelize_trajectory", "densify_waypoints",
+    # World
+    "World", "default_european_world",
+    # Aircraft
+    "AircraftPerformance", "LinearJetPerformance", "Aircraft", "a320_like",
+    # Flight
+    "AltitudeSegment", "AltitudeProfile", "Flight",
+    "available_fls",
+    "build_baseline_profile", "replace_segment_fl", "shift_all_segments",
+    "waypoints_for", "evaluate_option", "EvaluatedOption",
+    # Options
+    "OptionKind", "OptionSpec",
+    "enumerate_option_specs",
+    "build_and_evaluate_flight", "build_random_flights",
+    # QUBO
+    "ConflictEdge", "CapacityBucket", "QUBOInstance",
+    "build_conflict_graph", "build_capacity_buckets", "assemble_qubo",
+    "is_feasible", "cost_of_assignment", "brute_force_optimum",
+]
