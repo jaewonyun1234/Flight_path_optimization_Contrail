@@ -37,9 +37,9 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
-from typing import Callable
 
 from ortools.sat.python import cp_model
 
@@ -55,13 +55,13 @@ def _scaled_cost(ev: EvaluatedOption) -> int:
     return int(round(_COST_SCALE * ev.cost_combined))
 
 
-def _group_by_flight(evals: list[EvaluatedOption]) -> "OrderedDict[str, list[int]]":
+def _group_by_flight(evals: list[EvaluatedOption]) -> OrderedDict[str, list[int]]:
     """Map flight_name -> ordered list of eval indices belonging to it.
 
     Insertion order is preserved so the one-hot groups (and the brute-force
     enumeration) are deterministic across runs.
     """
-    groups: "OrderedDict[str, list[int]]" = OrderedDict()
+    groups: OrderedDict[str, list[int]] = OrderedDict()
     for idx, ev in enumerate(evals):
         groups.setdefault(ev.flight_name, []).append(idx)
     return groups
@@ -248,7 +248,7 @@ def enumerate_optimum(
             best_scaled = scaled
             best_chosen = {
                 name: evals[i].option_index
-                for name, i in zip(flight_names, combo)
+                for name, i in zip(flight_names, combo, strict=True)
             }
 
     if best_scaled is None:

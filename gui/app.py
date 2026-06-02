@@ -73,7 +73,7 @@ class SolveWorker(QThread):
 
     def __init__(
         self,
-        cfg: "solver_pb2.ScenarioConfig",
+        cfg: solver_pb2.ScenarioConfig,
         server_address: str = DEFAULT_SERVER_ADDRESS,
         sub_address: str = DEFAULT_SUB_ADDRESS,
     ) -> None:

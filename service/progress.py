@@ -29,8 +29,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
-from typing import Callable
+from collections.abc import Callable, Iterator
 
 import zmq
 
@@ -57,7 +56,7 @@ class ProgressPublisher:
         self._lock = threading.Lock()
         self._bound = False
 
-    def bind(self) -> "ProgressPublisher":
+    def bind(self) -> ProgressPublisher:
         """Bind the socket. Returns self so callers can do `Publisher(addr).bind()`."""
         self._socket.bind(self.address)
         self._bound = True

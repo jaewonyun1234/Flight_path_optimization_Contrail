@@ -15,7 +15,7 @@ to an `on_progress` callback; Task 4 wires that callback to a ZMQ publisher.
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
+from collections.abc import Callable
 
 import grpc
 
@@ -49,7 +49,7 @@ _DEFAULT_WEIGHTS = (1.0, 5.0, 0.5)
 # =============================================================================
 
 def build_scenario(
-    cfg: "solver_pb2.ScenarioConfig",
+    cfg: solver_pb2.ScenarioConfig,
 ) -> tuple[list[EvaluatedOption], list[ConflictEdge], list[CapacityBucket]]:
     """Reconstruct the contrail_env scenario from a ScenarioConfig.
 
@@ -78,7 +78,7 @@ def build_scenario(
 
 
 def solve_scenario(
-    cfg: "solver_pb2.ScenarioConfig",
+    cfg: solver_pb2.ScenarioConfig,
     on_progress: Callable[[int, float], None] | None = None,
 ) -> tuple[CPSATResult, int, list[EvaluatedOption]]:
     """Build the scenario for `cfg` and solve it. Returns (result, n_conflicts, evals)."""
@@ -97,7 +97,7 @@ def make_response(
     result: CPSATResult,
     n_conflicts: int,
     evals: list[EvaluatedOption],
-) -> "solver_pb2.SolveResponse":
+) -> solver_pb2.SolveResponse:
     """Pack a CPSATResult + scenario sizes into a SolveResponse message."""
     choices = []
     for i in result.chosen_eval_indices:
@@ -136,7 +136,7 @@ class SolverServicer(solver_pb2_grpc.SolverServicer):
         self._publisher = publisher
 
     def _make_progress_callback(
-        self, cfg: "solver_pb2.ScenarioConfig"
+        self, cfg: solver_pb2.ScenarioConfig
     ) -> Callable[[int, float], None] | None:
         """Build the per-solve progress sink bound to this request's topic."""
         publisher = self._publisher
@@ -151,9 +151,9 @@ class SolverServicer(solver_pb2_grpc.SolverServicer):
 
     async def Solve(  # noqa: N802 (gRPC method name is fixed by the proto)
         self,
-        request: "solver_pb2.ScenarioConfig",
+        request: solver_pb2.ScenarioConfig,
         context: grpc.aio.ServicerContext,
-    ) -> "solver_pb2.SolveResponse":
+    ) -> solver_pb2.SolveResponse:
         on_progress = self._make_progress_callback(request)
 
         # CP-SAT is blocking; run it off the event loop.

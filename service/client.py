@@ -23,14 +23,14 @@ class SolverClient:
         self._channel = grpc.insecure_channel(address)
         self._stub = solver_pb2_grpc.SolverStub(self._channel)
 
-    def solve(self, cfg: "solver_pb2.ScenarioConfig") -> "solver_pb2.SolveResponse":
+    def solve(self, cfg: solver_pb2.ScenarioConfig) -> solver_pb2.SolveResponse:
         """Send a ScenarioConfig and block until the SolveResponse returns."""
         return self._stub.Solve(cfg)
 
     def close(self) -> None:
         self._channel.close()
 
-    def __enter__(self) -> "SolverClient":
+    def __enter__(self) -> SolverClient:
         return self
 
     def __exit__(self, *exc: object) -> None:

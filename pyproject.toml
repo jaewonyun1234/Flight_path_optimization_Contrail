@@ -78,6 +78,8 @@ ignore_missing_imports = true
 warn_unused_ignores = false
 exclude = ["service/generated", "build/"]
 
+# Pre-existing env modules are vendored (the brief forbids editing them), so
+# their best-effort type errors are not enforced.
 [[tool.mypy.overrides]]
 module = [
     "contrail_env.units",
@@ -88,8 +90,17 @@ module = [
     "contrail_env.flight",
     "contrail_env.options",
     "contrail_env.qubo",
+    "contrail_env.demo",
 ]
 ignore_errors = true
+
+# protoc-generated stubs use runtime metaclass magic that static analysis
+# cannot see; treat the whole generated package as Any.
+[[tool.mypy.overrides]]
+module = ["service.generated.*"]
+follow_imports = "skip"
+ignore_errors = true
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
