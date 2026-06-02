@@ -1,0 +1,96 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contrail-optimization"
+version = "0.1.0"
+description = "Contrail-aware flight-option optimizer: synthetic airspace environment + CP-SAT solver behind a gRPC/ZMQ service with a PyQt6 desktop client."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "jaewonyun1234" }]
+keywords = ["optimization", "cp-sat", "contrails", "grpc", "zmq", "pyqt6"]
+
+dependencies = [
+    "numpy>=1.26",
+    "ortools>=9.10",
+    "grpcio>=1.60",
+    "grpcio-tools>=1.60",
+    "pyzmq>=25.0",
+    "PyQt6>=6.6",
+    "pyqtgraph>=0.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.8",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail"
+
+# ---------------------------------------------------------------------------
+# Packaging — two top-level packages live at the repo root.
+# `service.generated` is created at build/CI time by scripts/gen_proto.sh and
+# is intentionally NOT listed (it is gitignored); the editable install exposes
+# the `service` directory so the generated subpackage imports fine once built.
+# ---------------------------------------------------------------------------
+[tool.setuptools]
+packages = ["contrail_env", "service"]
+
+# ---------------------------------------------------------------------------
+# Ruff — lint the code we add in this layer. The nine pre-existing
+# `contrail_env` modules are treated as vendored source (the brief forbids
+# modifying them), so they are excluded; the new solver and the whole service/
+# gui/tests tree are linted normally.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+extend-exclude = [
+    "service/generated",
+    "contrail_env/__init__.py",
+    "contrail_env/demo.py",
+    "contrail_env/units.py",
+    "contrail_env/synthetic_issr.py",
+    "contrail_env/airspace.py",
+    "contrail_env/world.py",
+    "contrail_env/aircraft.py",
+    "contrail_env/flight.py",
+    "contrail_env/options.py",
+    "contrail_env/qubo.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
+
+# ---------------------------------------------------------------------------
+# Mypy — fully type-check the new code. The pre-existing modules cannot be
+# edited, so their (best-effort) type errors are not enforced; the new
+# solver_cpsat module and the service package ARE enforced.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = false
+exclude = ["service/generated", "build/"]
+
+[[tool.mypy.overrides]]
+module = [
+    "contrail_env.units",
+    "contrail_env.synthetic_issr",
+    "contrail_env.airspace",
+    "contrail_env.world",
+    "contrail_env.aircraft",
+    "contrail_env.flight",
+    "contrail_env.options",
+    "contrail_env.qubo",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
