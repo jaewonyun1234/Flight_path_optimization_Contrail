@@ -96,6 +96,11 @@ from .qubo import (
     is_feasible, cost_of_assignment, brute_force_optimum,
 )
 
+# CP-SAT classical ground-truth solver
+from .solver_cpsat import (
+    CPSATResult, solve_cpsat, enumerate_optimum,
+)
+
 __all__ = [
     # Units
     "M_PER_FT", "FT_PER_M", "M_PER_NM", "NM_PER_KM",
@@ -127,4 +132,6 @@ __all__ = [
     "ConflictEdge", "CapacityBucket", "QUBOInstance",
     "build_conflict_graph", "build_capacity_buckets", "assemble_qubo",
     "is_feasible", "cost_of_assignment", "brute_force_optimum",
+    # CP-SAT solver
+    "CPSATResult", "solve_cpsat", "enumerate_optimum",
 ]
