@@ -33,6 +33,7 @@ from contrail_env import (
 )
 
 from .generated import solver_pb2, solver_pb2_grpc
+from .progress import DEFAULT_PUB_ADDRESS, ProgressPublisher
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 50051
@@ -125,20 +126,28 @@ def make_response(
 # =============================================================================
 
 class SolverServicer(solver_pb2_grpc.SolverServicer):
-    """Implements the Solver service. One unary RPC: Solve."""
+    """Implements the Solver service. One unary RPC: Solve.
+
+    An optional ProgressPublisher streams each improved incumbent over ZMQ.
+    When no publisher is supplied (e.g. in tests), progress is only logged.
+    """
+
+    def __init__(self, publisher: ProgressPublisher | None = None) -> None:
+        self._publisher = publisher
 
     def _make_progress_callback(
         self, cfg: "solver_pb2.ScenarioConfig"
     ) -> Callable[[int, float], None] | None:
-        """Progress sink for a single solve.
+        """Build the per-solve progress sink bound to this request's topic."""
+        publisher = self._publisher
+        topic = cfg.progress_topic or "solve/progress"
 
-        Task 3 just logs the convergence curve; Task 4 overrides this to
-        publish each improvement over ZMQ on `cfg.progress_topic`.
-        """
-        def _log(improvement: int, objective: float) -> None:
+        def _on_progress(improvement: int, objective: float) -> None:
             print(f"[progress] improvement {improvement}: objective {objective:.2f}", flush=True)
+            if publisher is not None:
+                publisher.publish(topic, improvement, objective)
 
-        return _log
+        return _on_progress
 
     async def Solve(  # noqa: N802 (gRPC method name is fixed by the proto)
         self,
@@ -160,23 +169,32 @@ class SolverServicer(solver_pb2_grpc.SolverServicer):
 # =============================================================================
 
 async def start_server(
-    host: str = DEFAULT_HOST, port: int = DEFAULT_PORT
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    publisher: ProgressPublisher | None = None,
 ) -> tuple[grpc.aio.Server, int]:
     """Create, bind, and start the server. Returns (server, bound_port).
 
     Pass port=0 to bind an ephemeral port (used by the test fixture); the
-    actually-bound port is returned.
+    actually-bound port is returned. `publisher` is optional so tests can
+    run without binding a ZMQ socket.
     """
     server = grpc.aio.server()
-    solver_pb2_grpc.add_SolverServicer_to_server(SolverServicer(), server)
+    solver_pb2_grpc.add_SolverServicer_to_server(SolverServicer(publisher), server)
     bound_port = server.add_insecure_port(f"{host}:{port}")
     await server.start()
     return server, bound_port
 
 
-async def serve_forever(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
-    server, bound_port = await start_server(host, port)
+async def serve_forever(
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    progress_address: str = DEFAULT_PUB_ADDRESS,
+) -> None:
+    publisher = ProgressPublisher(progress_address).bind()
+    server, bound_port = await start_server(host, port, publisher)
     print(f"Solver gRPC server ready on {host}:{bound_port}", flush=True)
+    print(f"Publishing progress on ZMQ {progress_address}", flush=True)
     await server.wait_for_termination()
 
 
