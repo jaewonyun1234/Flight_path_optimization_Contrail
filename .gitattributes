@@ -1,0 +1,3 @@
+# Shell scripts must stay LF so they run on the Linux CI runner regardless of
+# a contributor's core.autocrlf setting (a CRLF shebang breaks `bash script.sh`).
+*.sh text eol=lf
