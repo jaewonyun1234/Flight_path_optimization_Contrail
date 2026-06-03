@@ -9,7 +9,8 @@ option per flight, avoid pairwise contrail conflicts, respect sector
 capacities). A [Google OR-Tools CP-SAT](https://developers.google.com/optimization/cp/cp_solver)
 solver finds the proven optimum behind a **gRPC** API; solver progress streams
 to clients over **ZMQ** pub/sub; and a **PyQt6** desktop app configures, runs,
-and monitors solves — live-plotting convergence and visualizing the problem.
+and monitors solves — live-plotting convergence and visualizing the problem in
+a 2D ISSR map and an interactive 3D trajectory view.
 
 The GUI never solves anything itself: it calls the service. That client/server
 split is the point — it mirrors a Python-bindings-over-gRPC/ZMQ stack with
@@ -79,9 +80,12 @@ python gui/app.py
 > version on Linux; both produce identical stubs.
 
 Click **Solve**: the objective curve updates live as CP-SAT improves its
-incumbent (streamed over ZMQ), the ISSR field is drawn at the selected flight
-level with each flight's route overlaid, and the results table fills with the
-chosen option, fuel, contrail cells, and disruption per flight.
+incumbent (streamed over ZMQ); the **3D trajectories** tab shows each flight's
+chosen route weaving through the ISSR contrail zones (drag to rotate); the **2D
+ISSR map** tab shows the field at a selected flight level with routes overlaid;
+and the results table fills with the chosen option, fuel, contrail cells, and
+disruption per flight. Each flight starts at its own (seed-randomized) cruise
+level, so the 3D view spans multiple altitudes.
 
 > A PyQt6 GUI needs a real display. CI runs the env/solver/server tests
 > headlessly; pull the repo and run `gui/app.py` locally to see the window and

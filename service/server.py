@@ -24,24 +24,15 @@ from contrail_env import (
     ConflictEdge,
     CPSATResult,
     EvaluatedOption,
-    build_and_evaluate_flight,
-    build_capacity_buckets,
-    build_conflict_graph,
-    build_random_flights,
-    default_european_world,
     solve_cpsat,
 )
 
 from .generated import solver_pb2, solver_pb2_grpc
 from .progress import DEFAULT_PUB_ADDRESS, ProgressPublisher
+from .scenario import build_scenario_full
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 50051
-
-# Fallback cost weights when a client leaves all three at 0 (proto3 scalars
-# cannot tell "unset" from "0", so an all-zero triple means "use the env
-# defaults" rather than the degenerate all-costs-zero objective).
-_DEFAULT_WEIGHTS = (1.0, 5.0, 0.5)
 
 
 # =============================================================================
@@ -51,29 +42,12 @@ _DEFAULT_WEIGHTS = (1.0, 5.0, 0.5)
 def build_scenario(
     cfg: solver_pb2.ScenarioConfig,
 ) -> tuple[list[EvaluatedOption], list[ConflictEdge], list[CapacityBucket]]:
-    """Reconstruct the contrail_env scenario from a ScenarioConfig.
+    """Solver inputs for a ScenarioConfig.
 
-    Everything is seeded, so identical configs produce identical problems.
+    Delegates to service.scenario (shared with the GUI) and drops the world
+    and flight objects, which the solver itself does not need.
     """
-    world = default_european_world(seed=cfg.seed, n_issr_blobs=cfg.n_issr_blobs)
-    flights = build_random_flights(
-        n_flights=cfg.n_flights,
-        world=world,
-        seed=cfg.seed,
-        corridor_frac=cfg.corridor_frac or 0.05,
-        snapshot_window_s=(0.0, cfg.snapshot_window_s or 300.0),
-    )
-
-    weights = (cfg.alpha_fuel, cfg.beta_contrail, cfg.gamma_disruption)
-    if weights == (0.0, 0.0, 0.0):
-        weights = _DEFAULT_WEIGHTS
-
-    evals: list[EvaluatedOption] = []
-    for flight in flights:
-        evals.extend(build_and_evaluate_flight(flight, world, cost_weights=weights))
-
-    conflicts = build_conflict_graph(evals, world)
-    buckets = build_capacity_buckets(evals, world)
+    _world, _flights, evals, conflicts, buckets = build_scenario_full(cfg)
     return evals, conflicts, buckets
 
 
