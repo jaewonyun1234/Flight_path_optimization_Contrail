@@ -63,7 +63,9 @@ scripts/gen_proto.sh regenerates the gRPC stubs from the .proto
 pip install -e .
 
 # 2. Generate the gRPC stubs (the generated/ folder is gitignored)
-bash scripts/gen_proto.sh
+bash scripts/gen_proto.sh        # macOS / Linux / Git Bash
+# Windows PowerShell has no `bash` — use the native script instead:
+#   .\scripts\gen_proto.ps1
 
 # 3. Start the solver service (one terminal)
 python -m service.server
@@ -71,6 +73,10 @@ python -m service.server
 # 4. Launch the desktop client (another terminal)
 python gui/app.py
 ```
+
+> **Windows note:** steps that show `bash scripts/gen_proto.sh` have a
+> PowerShell equivalent at `scripts/gen_proto.ps1`. The CI runs the `.sh`
+> version on Linux; both produce identical stubs.
 
 Click **Solve**: the objective curve updates live as CP-SAT improves its
 incumbent (streamed over ZMQ), the ISSR field is drawn at the selected flight
