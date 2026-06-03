@@ -27,13 +27,6 @@ in the contrail-routing literature.
 
 THE INTERFACE IS A PROTOCOL — so the user can swap in real BADA later
 without changing any other code.
-
-ROAD-TRIP ANALOGY
-=================
-- Aircraft type = car model (Honda Civic vs Ford F-150)
-- Current mass = how full the trunk is (heavier = less efficient)
-- Optimal altitude = best fuel-economy speed for current load
-- Step climb = upshifting to a higher gear as the load lightens
 """
 
 from __future__ import annotations

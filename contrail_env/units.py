@@ -20,12 +20,6 @@ Why bother? Two reasons:
     2. Quantum/optimization code expects pure numbers; staying in SI
        means we never have to ask "is this number feet or meters?"
        while reading a QUBO matrix.
-
-ROAD-TRIP ANALOGY
-=================
-Think of SI as the "metric system in the engine" and aviation units
-as "what the driver sees on the dashboard." The engine doesn't care
-whether the speedometer shows mph or km/h — it just reads RPM.
 """
 
 from __future__ import annotations

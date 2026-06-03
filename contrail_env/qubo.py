@@ -44,14 +44,6 @@ KEY FORMULAS (matching the project plan §3)
 The penalty constants A, B, C are AUTO-COMPUTED to satisfy the bound
     A, B, C > c_max - c_min
 with a configurable safety factor (default 2x).
-
-ROAD-TRIP ANALOGY
-=================
-This module takes "here are all the possible trips each driver could
-take, with costs, and here are the highway-patrol speed limits and
-road-closure warnings" and converts it into one big number — the
-"badness score" of any joint assignment of trip choices — that the
-optimizer can then minimize.
 """
 
 from __future__ import annotations

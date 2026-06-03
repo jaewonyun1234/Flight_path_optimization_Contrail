@@ -22,15 +22,6 @@ CORE CONCEPTS
                     time-bucket) IDs it visits. This is what becomes
                     a QUBO variable.
 
-ROAD-TRIP ANALOGY
-=================
-- A Flight is "I'm going from Boston to DC on Friday morning in my Civic."
-- An AltitudeProfile is "I'll take I-95 in the right lane the whole way"
-  vs "I'll take I-95 but switch to the carpool lane after Stamford."
-- A Trajectory is the full physical drive with timestamps.
-- An EvaluatedOption is the trip with mileage, fuel cost, and a list
-  of every toll plaza ID you drove through.
-
 WHY THIS LAYERED ABSTRACTION?
 =============================
 Because the QUBO needs SCALARS, not trajectories. By separating
@@ -221,11 +212,6 @@ def build_baseline_profile(
 
     The 90-min minimum-segment constraint (Dean et al. 2025) is what
     keeps the profile from "yo-yo"ing every time fuel drops a little.
-
-    ROAD-TRIP ANALOGY: like setting cruise control, then upshifting only
-    when both (a) the engine is asking for the upshift AND (b) you've
-    been in this gear long enough for the upshift to be worth the
-    "click."
     """
     perf = aircraft.performance
     mass = aircraft.initial_mass_kg

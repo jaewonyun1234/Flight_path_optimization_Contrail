@@ -14,14 +14,6 @@ This script wires every module together and verifies the full pipeline:
 
 Run with:
     python -m contrail_env.demo
-
-ROAD-TRIP ANALOGY
-=================
-This is the "full road trip dry run": we lay out the highways, place
-the rain zones, define the drivers' planned trips, generate alternative
-routes for each, find conflicts (drivers wanting the same rainy bit at
-the same time), check highway capacity limits, and finally hand the
-whole problem to a (brute-force) solver to find the best joint plan.
 """
 
 from __future__ import annotations

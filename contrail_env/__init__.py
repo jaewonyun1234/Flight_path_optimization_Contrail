@@ -6,7 +6,7 @@ all the structures the quantum solvers (Pasqal, Xanadu) and the classical
 verifier (CP-SAT) consume:
 
     - A planning region (AirspaceGrid)
-    - Ice-supersaturated rain zones (ISSRField)
+    - Ice-supersaturated regions (ISSRField)
     - ATC sectors with capacities (SectorMap, Sector)
     - Aircraft performance (Aircraft, LinearJetPerformance)
     - Flights with baseline + alternative altitude profiles (Flight, AltitudeProfile)

@@ -15,15 +15,6 @@ WHAT THIS MODULE PROVIDES
    (x, y, z, t) waypoints) and return the list of grid cells it passes
    through. This is the bridge between "physics" and "optimizer".
 
-ROAD-TRIP ANALOGIES
-===================
-- The grid is a mile-marker scheme on a road network: every position
-  gets snapped to the nearest marker (e.g., "I-95 mile 247, lane 3").
-- A sector is a stretch of highway under one state's traffic authority
-  (cars-per-mile-per-hour limit).
-- A "time bucket" is a 5-minute interval — like saying "rush hour at
-  Mile 247" vs "midnight at Mile 247" need different traffic budgets.
-
 KEY DESIGN DECISIONS
 ====================
 - Coordinates: pure Cartesian (km in x and y, meters in z).
@@ -201,9 +192,6 @@ class Sector:
     A SECTOR'S CAPACITY-BUCKET is the pair (sector, time-bucket): the
     capacity constraint applies to each (sector, time-bucket) pair
     independently, NOT to the sector as a whole over all time.
-
-    Road-trip: a sector with 6 time buckets is like a highway stretch
-    that has different car-count limits at different hours of the day.
     """
     name: str
     xy_cells: frozenset[tuple[int, int]]

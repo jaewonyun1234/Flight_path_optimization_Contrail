@@ -15,12 +15,6 @@ EVAPORATE quickly — instead they spread and persist as visible
 "contrail cirrus" for hours. These persistent contrails are aviation's
 single largest non-CO2 climate forcing component.
 
-ROAD-TRIP ANALOGY
-=================
-An ISSR is a rain zone you want to drive around. The "intensity" of
-the blob is how heavy the rain is; the "size" tells you how much
-detour it forces.
-
 WHY SYNTHETIC?
 ==============
 Real ISSR fields come from ERA5 reanalysis + a contrail model like
@@ -52,7 +46,7 @@ import numpy as np
 
 
 # =============================================================================
-# ISSR BLOB — a single ellipsoidal Gaussian "rain zone"
+# ISSR BLOB — a single ellipsoidal Gaussian region
 # =============================================================================
 
 @dataclass(frozen=True)

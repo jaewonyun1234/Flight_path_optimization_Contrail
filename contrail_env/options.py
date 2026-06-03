@@ -26,13 +26,6 @@ collapses to "fly the whole leg at a different altitude" anyway.
 For LONGER legs (>3 hours), local detours start to make sense, and
 options.py would need an extra function generating mid-leg perturbed
 profiles. We leave that as future work — see generate_local_avoidance().
-
-ROAD-TRIP ANALOGY
-=================
-Each option is a different "route plan" for the same trip. Option 0
-is "use the GPS default." Option 1 is "take the toll road" (faster but
-costs more). Option 2 is "take the scenic route" (slower but might
-avoid rain). The driver picks ONE; the QUBO picks for them.
 """
 
 from __future__ import annotations

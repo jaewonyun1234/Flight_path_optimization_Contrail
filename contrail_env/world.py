@@ -9,18 +9,12 @@ juggling three or four arguments.
 
 Conceptually, the World is "the planning region as it is right now":
     - WHERE flights can be (the AirspaceGrid)
-    - WHICH cells are rain zones (the ISSRField)
+    - WHICH cells are ice-supersaturated (the ISSRField)
     - WHO controls each cell and HOW BUSY it can get (the SectorMap)
 
 The World does not know about flights. Flights "enter" the world via
 their trajectories, which are then evaluated against the world's
 properties.
-
-ROAD-TRIP ANALOGY
-=================
-A World is the road map + the weather forecast + the highway-patrol
-roster. The cars (flights) drive across it; the map doesn't care which
-cars drive where.
 
 EXTENSIONS NOT INCLUDED HERE
 ============================
