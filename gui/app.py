@@ -1,55 +1,45 @@
-r"""
-app.py — PyQt6 desktop client for the contrail CP-SAT solver service.
+"""
+app.py — Researcher-focused analytical dashboard for the contrail QUBO pipeline.
 
-The GUI never solves anything itself: it sends a ScenarioConfig to the gRPC
-server, live-plots the convergence curve as ZMQ progress arrives, draws the
-problem (2D ISSR heatmap + interactive 3D trajectories), and tabulates the
-chosen option per flight. That client/server split is the whole point.
+This is NOT a geographic / animation view. It analyzes the *problem* and the
+*classical solver*: the live CP-SAT convergence stream, the conflict-graph
+topology, the assembled QUBO matrix, and the cost trade-offs of the chosen
+options. Quantum backends are future work, so everything here is about the
+QUBO encoding and the CP-SAT ground-truth solve.
 
-The scenario is rebuilt locally from the same (seeded) config the server used,
-via service.scenario — so what you SEE is exactly what the server SOLVED.
+DATA FLOW
+=========
+* The solve runs on the gRPC server; the GUI reaches it through SolveWorker
+  (a QThread) and streams progress over ZMQ — the UI never blocks.
+* The server returns only the solution, so the dashboard rebuilds the QUBO and
+  conflict graph LOCALLY from the same (seeded) ScenarioConfig via
+  service.scenario.build_scenario_full + contrail_env.assemble_qubo. Because the
+  scenario is fully seeded, the reconstruction matches what the server solved.
 
-3D VIEW
-=======
-Per flight it draws BOTH paths so the optimizer's effect is visible:
-    * baseline (the original plan)  — faint gray
-    * chosen   (the optimized plan) — bright, in the flight's color
-Options only change altitude, so the two share a ground track but sit at
-different heights. Segments that pass through an ISSR (forming a contrail) turn
-red on both. ISSR zones render as a glowing cloud (denser where RHi is higher).
-A small arrowhead + an "Airplane N" label mark each flight's heading.
-
-THREADING MODEL
-===============
-All network + solve work happens on a QThread worker (`SolveWorker`). The
-worker talks to the UI ONLY through Qt signals; it never touches a widget
-directly. Inside the worker, the blocking gRPC call runs on a small helper
-thread so the worker can read the ZMQ progress stream at the same time.
-
-RUN
-===
-    pip install -e .
-    bash scripts/gen_proto.sh        # Windows: .\scripts\gen_proto.ps1
-    python -m service.server         # in one terminal
-    python gui/app.py                # in another
+PANELS
+======
+1. Live CP-SAT convergence  — objective vs improvement index (ZMQ stream).
+2. Conflict-graph topology   — option nodes grouped by flight, conflict edges.
+3. QUBO & matrix analytics   — size, sparsity, penalty constants, energy offset,
+                               and a heatmap of |Q|.
+4. Trade-off results table   — chosen option per flight with fuel / contrail /
+                               disruption, to read off the alpha,beta,gamma trade.
 """
 
 from __future__ import annotations
 
-import math
 import random
 import sys
 import threading
 import time
+from collections import OrderedDict
 
 import numpy as np
 import pyqtgraph as pg
-import pyqtgraph.opengl as gl
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -65,11 +55,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from contrail_env import enumerate_option_specs, fl_to_m, m_to_fl, waypoints_for
+from contrail_env import assemble_qubo
 from service.client import DEFAULT_SERVER_ADDRESS, SolverClient
 from service.generated import solver_pb2
 from service.progress import DEFAULT_SUB_ADDRESS, subscribe
-from service.scenario import build_world_and_flights
+from service.scenario import build_scenario_full
 
 # Fixed scenario knobs not exposed as controls (sensible defaults per the brief).
 CORRIDOR_FRAC = 0.05
@@ -77,34 +67,11 @@ SNAPSHOT_WINDOW_S = 300.0
 # Head start (seconds) for the SUB socket to connect before the solve emits.
 _SUB_HEAD_START_S = 0.25
 
-# 3D display: altitude (flight level) is exaggerated against the horizontal km
-# so climbs/descents are visible. FL_CENTER maps to z=0 in the scene.
-_VSCALE = 6.0
-_FL_CENTER = 370.0
-
-# Baseline (original-plan) line color. Where any path forms a contrail, that
-# segment is drawn as a LIGHTER tint of its own color (see _lighten).
-_BASELINE_RGBA = (0.82, 0.82, 0.9, 0.6)          # light gray = original plan
-
-
-def _lighten(rgba, frac: float = 0.6):
-    """Blend a color toward white by `frac` (alpha unchanged)."""
-    r, g, b, a = rgba
-    return (r + (1.0 - r) * frac, g + (1.0 - g) * frac, b + (1.0 - b) * frac, a)
-
-
-def _flight_color_gl(i: int) -> tuple[float, float, float, float]:
-    """A distinct RGBA (0-1) color per flight for the 3D lines."""
-    c = pg.intColor(i, hues=9, alpha=255)
-    return (c.red() / 255.0, c.green() / 255.0, c.blue() / 255.0, 1.0)
-
-
-def _flight_pen_2d(i: int):
-    return pg.mkPen(pg.intColor(i, hues=9), width=2)
+_MONO = QFont("Consolas", 10)
 
 
 # =============================================================================
-# WORKER THREAD
+# WORKER THREAD  (unchanged contract: streams progress, returns SolveResponse)
 # =============================================================================
 
 class SolveWorker(QThread):
@@ -164,25 +131,27 @@ class SolveWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Contrail Optimizer — CP-SAT over gRPC/ZMQ")
+        self.setWindowTitle("Contrail QUBO Dashboard — CP-SAT ground truth")
 
         self._worker: SolveWorker | None = None
+        self._pending_cfg: solver_pb2.ScenarioConfig | None = None
+
         self._xs: list[int] = []
         self._ys: list[float] = []
 
-        # Scene state, kept in sync with the last-built config.
-        self._world = None
-        self._flights: list = []
-        self._pending_cfg: solver_pb2.ScenarioConfig | None = None
-
-        self._route_items: list[pg.PlotDataItem] = []
-        self._gl_items: list = []
+        # Reconstructed problem state (set by _rebuild_structure).
+        self._evals: list = []
+        self._conflicts: list = []
+        self._groups: OrderedDict[str, list[int]] = OrderedDict()
+        self._graph_texts: list[pg.TextItem] = []
 
         self._build_ui()
-        self._refresh_scene(self._build_cfg(), chosen=None)
+        self._rebuild_structure(self._build_cfg())
 
     # ------------------------------------------------------------------ UI ---
     def _build_ui(self) -> None:
+        pg.setConfigOptions(antialias=True)
+
         # --- Controls -------------------------------------------------------
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 9999)
@@ -201,115 +170,120 @@ class MainWindow(QMainWindow):
         self.beta_spin.setSingleStep(0.5)
         self.beta_spin.setValue(5.0)
 
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0.05, 1.0)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setValue(0.3)
+
         self.time_spin = QDoubleSpinBox()
         self.time_spin.setRange(0.1, 120.0)
         self.time_spin.setSingleStep(1.0)
         self.time_spin.setValue(10.0)
 
-        self.threshold_spin = QDoubleSpinBox()
-        self.threshold_spin.setRange(0.05, 1.0)
-        self.threshold_spin.setSingleStep(0.05)
-        self.threshold_spin.setValue(0.3)
-        self.threshold_spin.valueChanged.connect(self._on_scenario_changed)
-
-        self.fl_combo = QComboBox()
-        self.fl_combo.addItems(["FL340", "FL360", "FL380", "FL400"])
-        self.fl_combo.setCurrentText("FL360")
-        self.fl_combo.currentTextChanged.connect(self._on_fl_changed)
-
-        self.random_btn = QPushButton("Randomize flights")
-        self.random_btn.clicked.connect(self._on_randomize)
+        self.preview_btn = QPushButton("Randomize / preview instance")
+        self.preview_btn.clicked.connect(self._on_randomize)
 
         self.solve_btn = QPushButton("Solve")
         self.solve_btn.clicked.connect(self._on_solve)
 
-        # Rebuild the scene live when the scenario shape changes.
-        for spin in (self.seed_spin, self.flights_spin, self.blobs_spin):
-            spin.valueChanged.connect(self._on_scenario_changed)
-
         form = QFormLayout()
         form.addRow("Seed", self.seed_spin)
-        form.addRow("Flights", self.flights_spin)
+        form.addRow("Flights (F)", self.flights_spin)
         form.addRow("ISSR blobs", self.blobs_spin)
         form.addRow("Contrail weight (beta)", self.beta_spin)
         form.addRow("Contrail threshold (RHi)", self.threshold_spin)
-        form.addRow("Time limit (s)", self.time_spin)
-        form.addRow("2D map flight level", self.fl_combo)
-        form.addRow(self.random_btn)
+        form.addRow("CP-SAT time limit (s)", self.time_spin)
+        form.addRow(self.preview_btn)
         form.addRow(self.solve_btn)
 
-        controls_box = QGroupBox("Scenario")
+        controls_box = QGroupBox("Instance / solver controls")
         controls_box.setLayout(form)
 
-        self.status_label = QLabel("idle")
-        self.status_label.setWordWrap(True)
-
-        # --- Results table --------------------------------------------------
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(
-            ["Airplane", "Opt#", "Init FL", "Opt FL", "Fuel (kg)", "Contrail", "Disrupt"]
-        )
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.summary = QLabel("idle")
+        self.summary.setWordWrap(True)
+        self.summary.setFont(_MONO)
 
         left = QVBoxLayout()
         left.addWidget(controls_box)
-        left.addWidget(self.status_label)
-        left.addWidget(QLabel("Chosen options"))
-        left.addWidget(self.table, stretch=1)
+        left.addWidget(self.summary)
+        left.addStretch(1)
         left_widget = QWidget()
         left_widget.setLayout(left)
+        left_widget.setFixedWidth(320)
 
-        # --- Live objective plot -------------------------------------------
-        self.plot = pg.PlotWidget(title="Best objective vs improvement")
-        self.plot.setLabel("bottom", "improvement index")
-        self.plot.setLabel("left", "objective")
-        self.plot.showGrid(x=True, y=True, alpha=0.3)
-        self.curve = self.plot.plot([], [], pen=pg.mkPen("c", width=2), symbol="o", symbolSize=6)
-
-        # --- 3D trajectory view --------------------------------------------
-        self.gl_view = gl.GLViewWidget()
-        self.gl_view.setCameraPosition(distance=1700, elevation=22, azimuth=-60)
-        gl_note = QLabel(
-            "Drag to rotate, scroll to zoom.  Vertical = flight level (exaggerated).  "
-            "Gray = original plan, bright = optimized; a segment turns lighter where it "
-            "forms a contrail.  Orange ellipsoids = ISSR zones (bright dense core, the "
-            "edge sits at the contrail threshold)."
-        )
-        gl_note.setWordWrap(True)
-        gl_panel = QVBoxLayout()
-        gl_panel.addWidget(self.gl_view, stretch=1)
-        gl_panel.addWidget(gl_note)
-        gl_widget = QWidget()
-        gl_widget.setLayout(gl_panel)
-
-        # --- 2D ISSR map + routes ------------------------------------------
-        self.map_widget = pg.PlotWidget(title="ISSR field + flight routes (top-down)")
-        self.map_widget.setLabel("bottom", "x (km)")
-        self.map_widget.setLabel("left", "y (km)")
-        self.img = pg.ImageItem()
-        try:
-            self.img.setColorMap(pg.colormap.get("viridis"))
-        except Exception:
-            pass  # colormap is cosmetic; never block the UI on it
-        self.map_widget.addItem(self.img)
-
-        # Tabs: show the 3D view first (the headline), 2D map second.
-        self.view_tabs = QTabWidget()
-        self.view_tabs.addTab(gl_widget, "3D trajectories")
-        self.view_tabs.addTab(self.map_widget, "2D ISSR map")
-
-        right = QVBoxLayout()
-        right.addWidget(self.plot, stretch=1)
-        right.addWidget(self.view_tabs, stretch=2)
-        right_widget = QWidget()
-        right_widget.setLayout(right)
+        # --- Tabs -----------------------------------------------------------
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_convergence_tab(), "1 · Convergence")
+        self.tabs.addTab(self._build_graph_tab(), "2 · Conflict graph")
+        self.tabs.addTab(self._build_qubo_tab(), "3 · QUBO analytics")
+        self.tabs.addTab(self._build_results_tab(), "4 · Trade-offs")
 
         root = QHBoxLayout()
-        root.addWidget(left_widget, stretch=0)
-        root.addWidget(right_widget, stretch=1)
+        root.addWidget(left_widget)
+        root.addWidget(self.tabs, stretch=1)
         central = QWidget()
         central.setLayout(root)
         self.setCentralWidget(central)
+
+    def _build_convergence_tab(self) -> QWidget:
+        self.conv_plot = pg.PlotWidget(title="CP-SAT incumbent objective (live, via ZMQ)")
+        self.conv_plot.setLabel("bottom", "improvement index")
+        self.conv_plot.setLabel("left", "objective (combined cost)")
+        self.conv_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.conv_curve = self.conv_plot.plot(
+            [], [], pen=pg.mkPen("c", width=2), symbol="o", symbolSize=7
+        )
+        return self.conv_plot
+
+    def _build_graph_tab(self) -> QWidget:
+        self.graph_plot = pg.PlotWidget(
+            title="Conflict graph — columns = flights, dots = options, lines = ISSR conflicts"
+        )
+        self.graph_plot.setLabel("bottom", "flight index")
+        self.graph_plot.setLabel("left", "option index (k)")
+        self.graph_plot.showGrid(x=True, y=True, alpha=0.15)
+        self.edge_item = self.graph_plot.plot([], [])
+        self.node_item = pg.ScatterPlotItem()
+        self.graph_plot.addItem(self.node_item)
+        return self.graph_plot
+
+    def _build_qubo_tab(self) -> QWidget:
+        self.qubo_stats = QLabel("—")
+        self.qubo_stats.setFont(_MONO)
+        self.qubo_stats.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        stats_box = QGroupBox("QUBOInstance")
+        stats_layout = QVBoxLayout()
+        stats_layout.addWidget(self.qubo_stats)
+        stats_layout.addStretch(1)
+        stats_box.setLayout(stats_layout)
+        stats_box.setFixedWidth(330)
+
+        self.qubo_view = pg.PlotWidget(title="|Q|  (upper-triangular QUBO matrix)")
+        self.qubo_view.setLabel("bottom", "variable j")
+        self.qubo_view.setLabel("left", "variable i")
+        self.qubo_view.invertY(True)
+        self.qubo_view.setAspectLocked(True)
+        self.qubo_img = pg.ImageItem()
+        try:
+            self.qubo_img.setColorMap(pg.colormap.get("inferno"))
+        except Exception:
+            pass
+        self.qubo_view.addItem(self.qubo_img)
+
+        row = QHBoxLayout()
+        row.addWidget(stats_box)
+        row.addWidget(self.qubo_view, stretch=1)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        return wrap
+
+    def _build_results_tab(self) -> QWidget:
+        self.results = QTableWidget(0, 5)
+        self.results.setHorizontalHeaderLabels(
+            ["Flight", "Chosen opt#", "Fuel (kg)", "Contrail cells", "Disruption (FL-min)"]
+        )
+        self.results.horizontalHeader().setStretchLastSection(True)
+        return self.results
 
     # ---------------------------------------------------------------- config --
     def _build_cfg(self, topic: str = "") -> solver_pb2.ScenarioConfig:
@@ -327,226 +301,112 @@ class MainWindow(QMainWindow):
             progress_topic=topic,
         )
 
-    # -------------------------------------------------------------- rendering --
-    def _refresh_scene(
-        self, cfg: solver_pb2.ScenarioConfig, chosen: dict[str, int] | None
-    ) -> None:
-        """Rebuild world + flights from cfg, then redraw both views."""
+    # ------------------------------------------------- problem reconstruction --
+    def _rebuild_structure(self, cfg: solver_pb2.ScenarioConfig) -> None:
+        """Rebuild the QUBO + conflict graph locally and refresh panels 2 & 3."""
         try:
-            self._world, self._flights = build_world_and_flights(cfg)
+            _world, _flights, evals, conflicts, buckets = build_scenario_full(cfg)
+            qubo = assemble_qubo(evals, conflicts, buckets)
         except Exception as exc:
-            self.status_label.setText(f"scene build failed: {exc}")
+            self.summary.setText(f"instance build failed:\n{exc}")
             return
-        self._render_map()
-        self._render_3d(chosen)
 
-    def _selected_fl(self) -> int:
-        return int(self.fl_combo.currentText().replace("FL", ""))
+        self._evals = evals
+        self._conflicts = conflicts
+        groups: OrderedDict[str, list[int]] = OrderedDict()
+        for idx, ev in enumerate(evals):
+            groups.setdefault(ev.flight_name, []).append(idx)
+        self._groups = groups
 
-    def _render_map(self) -> None:
-        if self._world is None:
+        self._render_conflict_graph(set())
+        self._render_qubo(qubo, len(conflicts), len(buckets))
+        self.summary.setText(
+            f"instance ready\n"
+            f"F={len(groups)}  options={qubo.n_options}\n"
+            f"conflicts={len(conflicts)}  buckets={len(buckets)}\n"
+            f"N_total={qubo.n}\n"
+            f"-> click Solve"
+        )
+
+    def _render_conflict_graph(self, chosen: set[int]) -> None:
+        n = len(self._evals)
+        if n == 0:
+            self.node_item.setData([])
+            self.edge_item.setData([], [])
             return
-        g = self._world.grid
-        xx, yy = g.meshgrid_xy()
-        zz = np.full_like(xx, fl_to_m(self._selected_fl()))
-        field = self._world.issr.rhi_excess_grid(xx, yy, zz)
 
-        self.img.setImage(field, autoLevels=True)
-        self.img.setRect(
-            g.x_min_km, g.y_min_km, g.x_max_km - g.x_min_km, g.y_max_km - g.y_min_km
+        pos = np.zeros((n, 2), dtype=float)
+        for ff, members in enumerate(self._groups.values()):
+            for kk, idx in enumerate(members):
+                pos[idx] = (ff, kk)
+
+        # Conflict edges as disconnected segments (two points per edge).
+        ex: list[float] = []
+        ey: list[float] = []
+        for e in self._conflicts:
+            ex += [pos[e.i][0], pos[e.j][0]]
+            ey += [pos[e.i][1], pos[e.j][1]]
+        self.edge_item.setData(
+            x=np.array(ex), y=np.array(ey),
+            connect="pairs", pen=pg.mkPen((150, 150, 170, 120), width=1),
         )
 
-        for item in self._route_items:
-            self.map_widget.removeItem(item)
-        self._route_items = []
-        for i, flight in enumerate(self._flights):
-            ox, oy = flight.origin_km
-            dx, dy = flight.destination_km
-            line = self.map_widget.plot([ox, dx], [oy, dy], pen=_flight_pen_2d(i))
-            self._route_items.append(line)
+        n_groups = max(1, len(self._groups))
+        spots = []
+        for ff, members in enumerate(self._groups.values()):
+            color = pg.intColor(ff, hues=n_groups)
+            for kk, idx in enumerate(members):
+                hit = idx in chosen
+                spots.append({
+                    "pos": (ff, kk),
+                    "brush": color,
+                    "size": 22 if hit else 13,
+                    "pen": pg.mkPen("w", width=2) if hit else pg.mkPen((20, 20, 20)),
+                })
+        self.node_item.setData(spots=spots)
 
-    def _render_3d(self, chosen: dict[str, int] | None) -> None:
-        if self._world is None:
-            return
-        try:
-            self._render_3d_inner(chosen)
-        except Exception as exc:
-            self.status_label.setText(f"3D render failed: {exc}")
+        for t in self._graph_texts:
+            self.graph_plot.removeItem(t)
+        self._graph_texts = []
+        for ff, name in enumerate(self._groups.keys()):
+            label = pg.TextItem(name, color=(210, 210, 210), anchor=(0.5, 1.0))
+            label.setPos(ff, -0.5)
+            self.graph_plot.addItem(label)
+            self._graph_texts.append(label)
 
-    # --- 3D helpers ----------------------------------------------------------
-    def _add_gl(self, item) -> None:
-        self.gl_view.addItem(item)
-        self._gl_items.append(item)
+    def _render_qubo(self, qubo, n_conflicts: int, n_buckets: int) -> None:
+        q = qubo.Q
+        self.qubo_img.setImage(np.abs(q), autoLevels=True)
 
-    def _scene_xform(self):
-        g = self._world.grid
-        cx = (g.x_min_km + g.x_max_km) / 2.0
-        cy = (g.y_min_km + g.y_max_km) / 2.0
-
-        def to_scene(x_km: float, y_km: float, fl: float) -> tuple[float, float, float]:
-            return (x_km - cx, y_km - cy, (fl - _FL_CENTER) * _VSCALE)
-
-        return to_scene
-
-    def _line_points(self, to_scene, waypoints) -> np.ndarray:
-        return np.array(
-            [to_scene(x, y, m_to_fl(z)) for (x, y, z, _t) in waypoints], dtype=float
+        n = qubo.n
+        nonzero = int(np.count_nonzero(q))
+        density = 100.0 * nonzero / (n * n) if n else 0.0
+        self.qubo_stats.setText(
+            f"N_total        : {n}\n"
+            f"  option vars  : {qubo.n_options}\n"
+            f"  slack bits   : {qubo.n_slack}\n"
+            f"flights (F)    : {len(self._groups)}\n"
+            f"conflict edges : {n_conflicts}\n"
+            f"capacity bkts  : {n_buckets}\n"
+            f"\n"
+            f"Q non-zeros    : {nonzero} / {n * n}\n"
+            f"Q density      : {density:.1f} %\n"
+            f"(Q is upper-triangular)\n"
+            f"\n"
+            f"penalty A (1-hot)   : {qubo.penalty_A:.1f}\n"
+            f"penalty B (conflict): {qubo.penalty_B:.1f}\n"
+            f"penalty C (capacity): {qubo.penalty_C:.1f}\n"
+            f"energy offset       : {qubo.constant:.1f}"
         )
-
-    def _vertex_colors(self, waypoints, normal_rgba) -> np.ndarray:
-        issr = self._world.issr
-        contrail_rgba = _lighten(normal_rgba)
-        return np.array(
-            [contrail_rgba if issr.is_inside(x, y, z) else normal_rgba
-             for (x, y, z, _t) in waypoints],
-            dtype=float,
-        )
-
-    def _arrowhead(self, head: np.ndarray, ox: float, oy: float,
-                   dx: float, dy: float, size: float = 45.0) -> np.ndarray:
-        theta = math.atan2(dy - oy, dx - ox)
-        hx, hy, hz = float(head[0]), float(head[1]), float(head[2])
-        pts = []
-        for back in (math.radians(150.0), math.radians(-150.0)):
-            a = theta + back
-            pts.append((hx, hy, hz))
-            pts.append((hx + size * math.cos(a), hy + size * math.sin(a), hz))
-        return np.array(pts, dtype=float)
-
-    def _add_label(self, pos, text: str, color, size: int = 8) -> None:
-        try:
-            label = gl.GLTextItem(
-                pos=np.array(pos, dtype=float), text=text, color=color,
-                font=QFont("Helvetica", size),
-            )
-            self._add_gl(label)
-        except Exception:
-            pass  # GLTextItem may be unavailable on some pyqtgraph builds
-
-    def _render_3d_inner(self, chosen: dict[str, int] | None) -> None:
-        for item in self._gl_items:
-            self.gl_view.removeItem(item)
-        self._gl_items = []
-
-        to_scene = self._scene_xform()
-        g = self._world.grid
-
-        # Reference grid at the FL340 plane.
-        grid = gl.GLGridItem()
-        grid.setSize(g.x_max_km - g.x_min_km, g.y_max_km - g.y_min_km)
-        grid.setSpacing(100, 100)
-        grid.translate(0, 0, (340 - _FL_CENTER) * _VSCALE)
-        self._add_gl(grid)
-
-        self._add_issr_blobs(to_scene)
-
-        gray = pg.mkColor((210, 210, 230))
-        for i, flight in enumerate(self._flights):
-            specs = enumerate_option_specs(flight)
-            chosen_idx = chosen.get(flight.name, 0) if chosen else 0
-            chosen_idx = max(0, min(chosen_idx, len(specs) - 1))
-            base_fl = specs[0].profile.segments[0].fl
-            opt_fl = specs[chosen_idx].profile.segments[0].fl
-            fcolor = _flight_color_gl(i)
-            fqcolor = pg.intColor(i, hues=9)
-
-            # Original (baseline) path — light gray, drawn only when it differs
-            # from the optimized one (otherwise the optimized line IS baseline).
-            if chosen is not None and chosen_idx != 0:
-                base_wps = waypoints_for(flight, specs[0].profile, sample_dt_s=30.0)
-                base_pts = self._line_points(to_scene, base_wps)
-                base_cols = self._vertex_colors(base_wps, _BASELINE_RGBA)
-                self._add_gl(gl.GLLinePlotItem(
-                    pos=base_pts, color=base_cols, width=2.0, antialias=True
-                ))
-                self._add_label(
-                    (float(base_pts[-1][0]), float(base_pts[-1][1]),
-                     float(base_pts[-1][2]) + 20.0),
-                    f"orig FL{base_fl}", gray, size=7,
-                )
-
-            # Optimized (chosen) path in the flight's bright color.
-            wps = waypoints_for(flight, specs[chosen_idx].profile, sample_dt_s=30.0)
-            pts = self._line_points(to_scene, wps)
-            cols = self._vertex_colors(wps, fcolor)
-            self._add_gl(gl.GLLinePlotItem(pos=pts, color=cols, width=3.5, antialias=True))
-
-            # Direction arrowhead + altitude-tagged label at the nose.
-            ox, oy = flight.origin_km
-            dx, dy = flight.destination_km
-            arrow = self._arrowhead(pts[-1], ox, oy, dx, dy)
-            self._add_gl(gl.GLLinePlotItem(
-                pos=arrow, color=fcolor, width=2.5, mode="lines"
-            ))
-            tag = f"Airplane {i + 1}  FL{opt_fl}"
-            if chosen is not None and chosen_idx == 0:
-                tag += " (kept)"
-            self._add_label(
-                (float(pts[-1][0]), float(pts[-1][1]), float(pts[-1][2]) + 26.0),
-                tag, fqcolor, size=8,
-            )
-
-        self.gl_view.setCameraPosition(
-            distance=max(g.x_max_km - g.x_min_km, 1200), elevation=22, azimuth=-60
-        )
-
-    def _add_issr_blobs(self, to_scene) -> None:
-        """Each ISSR as a translucent ellipsoid with a bright, dense Gaussian core.
-
-        Concentric shells drawn additively make the center glow brightest and
-        fade outward. The outer shell sits at the RHi-excess threshold surface,
-        so raising/lowering the threshold visibly shrinks/grows each blob.
-        """
-        issr = self._world.issr
-        threshold = max(1e-3, float(issr.threshold))
-        # (radius as a fraction of the threshold surface, RGB, alpha)
-        shells = [
-            (0.45, (1.0, 0.88, 0.6), 0.30),   # bright dense core
-            (0.72, (1.0, 0.55, 0.22), 0.16),
-            (1.0, (1.0, 0.4, 0.12), 0.08),     # faint edge at the threshold
-        ]
-        for blob in issr.blobs:
-            intensity = max(1e-3, blob.intensity)
-            if threshold < intensity:
-                r_thr = math.sqrt(max(0.2, -2.0 * math.log(threshold / intensity)))
-            else:
-                r_thr = 0.4  # whole blob below threshold; show a faint nub
-            r_thr = min(r_thr, 3.0)
-
-            center = to_scene(blob.cx_km, blob.cy_km, m_to_fl(blob.cz_m))
-            sigma_h = blob.sigma_h_km
-            sigma_v_scene = (blob.sigma_v_m / 30.48) * _VSCALE  # m -> FL -> scene
-            for frac, rgb, alpha in shells:
-                rad = frac * r_thr
-                scale = (rad * sigma_h, rad * sigma_h, rad * sigma_v_scene)
-                self._add_ellipsoid(center, scale, (rgb[0], rgb[1], rgb[2], alpha))
-
-    def _add_ellipsoid(self, center, scale, color) -> None:
-        md = gl.MeshData.sphere(rows=10, cols=20)
-        verts = md.vertexes() * np.asarray(scale, dtype=float) + np.asarray(center, dtype=float)
-        mesh = gl.MeshData(vertexes=verts, faces=md.faces())
-        try:
-            item = gl.GLMeshItem(
-                meshdata=mesh, smooth=True, color=color,
-                shader="balloon", glOptions="additive",
-            )
-        except Exception:
-            item = gl.GLMeshItem(
-                meshdata=mesh, smooth=True, color=color, glOptions="translucent"
-            )
-        self._add_gl(item)
 
     # ---------------------------------------------------------------- slots ---
-    def _on_scenario_changed(self, _value: int) -> None:
-        self._refresh_scene(self._build_cfg(), chosen=None)
-
     def _on_randomize(self) -> None:
-        # A fresh seed re-rolls headings, altitudes, and ISSR placement. Setting
-        # the spin box fires valueChanged -> _on_scenario_changed -> rebuild.
+        # New seed re-rolls the instance; preview its structure without solving.
         self.seed_spin.setValue(random.randint(0, 9999))
-
-    def _on_fl_changed(self, _text: str) -> None:
-        self._render_map()  # only the 2D heatmap layer depends on the chosen FL
+        self._xs, self._ys = [], []
+        self.conv_curve.setData([], [])
+        self.results.setRowCount(0)
+        self._rebuild_structure(self._build_cfg())
 
     def _on_solve(self) -> None:
         if self._worker is not None and self._worker.isRunning():
@@ -556,10 +416,11 @@ class MainWindow(QMainWindow):
         cfg = self._build_cfg(topic)
         self._pending_cfg = cfg
 
-        self._refresh_scene(cfg, chosen=None)  # show baseline routes immediately
+        self._rebuild_structure(cfg)
         self._xs, self._ys = [], []
-        self.curve.setData([], [])
-        self.status_label.setText("solving…")
+        self.conv_curve.setData([], [])
+        self.results.setRowCount(0)
+        self.summary.setText("solving…")
         self.solve_btn.setEnabled(False)
 
         self._worker = SolveWorker(cfg)
@@ -571,58 +432,50 @@ class MainWindow(QMainWindow):
     def _on_progress(self, improvement: int, objective: float) -> None:
         self._xs.append(improvement)
         self._ys.append(objective)
-        self.curve.setData(self._xs, self._ys)
+        self.conv_curve.setData(self._xs, self._ys)
 
     def _on_finished(self, resp: object) -> None:
         choices = resp.choices  # type: ignore[attr-defined]
 
-        # Redraw with the chosen options first — this also rebuilds self._flights,
-        # which we then read to report the initial vs optimized altitude.
-        chosen = {c.flight_name: c.chosen_option for c in choices}
-        if self._pending_cfg is not None:
-            self._refresh_scene(self._pending_cfg, chosen=chosen)
-        specs_by_name = {f.name: enumerate_option_specs(f) for f in self._flights}
-
-        self.table.setRowCount(len(choices))
+        self.results.setRowCount(len(choices))
         for row, c in enumerate(choices):
-            specs = specs_by_name.get(c.flight_name)
-            if specs:
-                init_fl = specs[0].profile.segments[0].fl
-                idx = max(0, min(c.chosen_option, len(specs) - 1))
-                opt_fl = specs[idx].profile.segments[0].fl
-            else:
-                init_fl = opt_fl = 0
-            try:
-                airplane = f"Airplane {int(c.flight_name[1:])}"
-            except ValueError:
-                airplane = c.flight_name
-            self.table.setItem(row, 0, QTableWidgetItem(airplane))
-            self.table.setItem(row, 1, QTableWidgetItem(str(c.chosen_option)))
-            self.table.setItem(row, 2, QTableWidgetItem(f"FL{init_fl}"))
-            self.table.setItem(row, 3, QTableWidgetItem(f"FL{opt_fl}"))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{c.fuel_kg:.0f}"))
-            self.table.setItem(row, 5, QTableWidgetItem(str(c.contrail_cells)))
-            self.table.setItem(row, 6, QTableWidgetItem(f"{c.disruption_flmin:.1f}"))
+            values = [
+                c.flight_name,
+                str(c.chosen_option),
+                f"{c.fuel_kg:.0f}",
+                str(c.contrail_cells),
+                f"{c.disruption_flmin:.1f}",
+            ]
+            for col, val in enumerate(values):
+                self.results.setItem(row, col, QTableWidgetItem(val))
 
-        self.status_label.setText(
-            f"objective = {resp.objective:.2f}   "  # type: ignore[attr-defined]
-            f"status = {resp.status}   "  # type: ignore[attr-defined]
-            f"wall = {resp.wall_clock_s * 1000:.0f} ms   "  # type: ignore[attr-defined]
-            f"conflicts = {resp.n_conflicts}   "  # type: ignore[attr-defined]
+        self.summary.setText(
+            f"E* = {resp.objective:.2f}\n"  # type: ignore[attr-defined]
+            f"status = {resp.status}\n"  # type: ignore[attr-defined]
+            f"wall = {resp.wall_clock_s * 1000:.0f} ms\n"  # type: ignore[attr-defined]
+            f"conflicts = {resp.n_conflicts}\n"  # type: ignore[attr-defined]
             f"options = {resp.n_options_total}"  # type: ignore[attr-defined]
         )
+
+        # Highlight the chosen option node in the conflict graph.
+        chosen_idx: set[int] = set()
+        for c in choices:
+            members = self._groups.get(c.flight_name)
+            if members and 0 <= c.chosen_option < len(members):
+                chosen_idx.add(members[c.chosen_option])
+        self._render_conflict_graph(chosen_idx)
+
         self.solve_btn.setEnabled(True)
 
     def _on_failed(self, message: str) -> None:
-        self.status_label.setText(f"solve failed: {message}")
+        self.summary.setText(f"solve failed:\n{message}")
         self.solve_btn.setEnabled(True)
 
 
 def main() -> None:
-    pg.setConfigOptions(antialias=True)
     app = QApplication(sys.argv)
     win = MainWindow()
-    win.resize(1280, 800)
+    win.resize(1280, 760)
     win.show()
     sys.exit(app.exec())
 
