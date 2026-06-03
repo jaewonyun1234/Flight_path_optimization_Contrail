@@ -37,6 +37,7 @@ RUN
 from __future__ import annotations
 
 import math
+import random
 import sys
 import threading
 import time
@@ -45,6 +46,7 @@ import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -81,9 +83,9 @@ _VSCALE = 6.0
 _FL_CENTER = 370.0
 
 # Trajectory colors.
-_BASELINE_RGBA = (0.55, 0.55, 0.6, 0.5)      # faint gray = original plan
-_CONTRAIL_BASELINE_RGBA = (0.8, 0.2, 0.2, 0.8)
-_CONTRAIL_CHOSEN_RGBA = (1.0, 0.15, 0.15, 1.0)  # bright red = forming a contrail
+_BASELINE_RGBA = (0.82, 0.82, 0.9, 0.6)          # light gray = original plan
+_CONTRAIL_BASELINE_RGBA = (0.9, 0.45, 0.45, 0.75)
+_CONTRAIL_CHOSEN_RGBA = (1.0, 0.12, 0.12, 1.0)   # bright red = forming a contrail
 
 
 def _flight_color_gl(i: int) -> tuple[float, float, float, float]:
@@ -204,6 +206,9 @@ class MainWindow(QMainWindow):
         self.fl_combo.setCurrentText("FL360")
         self.fl_combo.currentTextChanged.connect(self._on_fl_changed)
 
+        self.random_btn = QPushButton("Randomize flights")
+        self.random_btn.clicked.connect(self._on_randomize)
+
         self.solve_btn = QPushButton("Solve")
         self.solve_btn.clicked.connect(self._on_solve)
 
@@ -218,6 +223,7 @@ class MainWindow(QMainWindow):
         form.addRow("Contrail weight (beta)", self.beta_spin)
         form.addRow("Time limit (s)", self.time_spin)
         form.addRow("2D map flight level", self.fl_combo)
+        form.addRow(self.random_btn)
         form.addRow(self.solve_btn)
 
         controls_box = QGroupBox("Scenario")
@@ -227,9 +233,9 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
 
         # --- Results table --------------------------------------------------
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Flight", "Option", "Fuel (kg)", "Contrail cells", "Disruption (FL-min)"]
+            ["Airplane", "Opt#", "Init FL", "Opt FL", "Fuel (kg)", "Contrail", "Disrupt"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
 
@@ -392,10 +398,11 @@ class MainWindow(QMainWindow):
             pts.append((hx + size * math.cos(a), hy + size * math.sin(a), hz))
         return np.array(pts, dtype=float)
 
-    def _add_label(self, pos, text: str, i: int) -> None:
+    def _add_label(self, pos, text: str, color, size: int = 8) -> None:
         try:
             label = gl.GLTextItem(
-                pos=np.array(pos, dtype=float), text=text, color=pg.intColor(i, hues=9)
+                pos=np.array(pos, dtype=float), text=text, color=color,
+                font=QFont("Helvetica", size),
             )
             self._add_gl(label)
         except Exception:
@@ -418,13 +425,18 @@ class MainWindow(QMainWindow):
 
         self._add_issr_cloud(to_scene)
 
+        gray = pg.mkColor((210, 210, 230))
         for i, flight in enumerate(self._flights):
             specs = enumerate_option_specs(flight)
             chosen_idx = chosen.get(flight.name, 0) if chosen else 0
             chosen_idx = max(0, min(chosen_idx, len(specs) - 1))
+            base_fl = specs[0].profile.segments[0].fl
+            opt_fl = specs[chosen_idx].profile.segments[0].fl
+            fcolor = _flight_color_gl(i)
+            fqcolor = pg.intColor(i, hues=9)
 
-            # Original (baseline) path — only drawn once there's an optimized
-            # path to compare it against.
+            # Original (baseline) path — light gray, drawn only when it differs
+            # from the optimized one (otherwise the optimized line IS baseline).
             if chosen is not None and chosen_idx != 0:
                 base_wps = waypoints_for(flight, specs[0].profile, sample_dt_s=30.0)
                 base_pts = self._line_points(to_scene, base_wps)
@@ -432,26 +444,34 @@ class MainWindow(QMainWindow):
                     base_wps, _BASELINE_RGBA, _CONTRAIL_BASELINE_RGBA
                 )
                 self._add_gl(gl.GLLinePlotItem(
-                    pos=base_pts, color=base_cols, width=1.5, antialias=True
+                    pos=base_pts, color=base_cols, width=2.0, antialias=True
                 ))
+                self._add_label(
+                    (float(base_pts[-1][0]), float(base_pts[-1][1]),
+                     float(base_pts[-1][2]) + 20.0),
+                    f"orig FL{base_fl}", gray, size=7,
+                )
 
-            # Optimized (chosen) path in the flight's color.
+            # Optimized (chosen) path in the flight's bright color.
             wps = waypoints_for(flight, specs[chosen_idx].profile, sample_dt_s=30.0)
             pts = self._line_points(to_scene, wps)
-            cols = self._vertex_colors(
-                wps, _flight_color_gl(i), _CONTRAIL_CHOSEN_RGBA
-            )
-            self._add_gl(gl.GLLinePlotItem(pos=pts, color=cols, width=3.0, antialias=True))
+            cols = self._vertex_colors(wps, fcolor, _CONTRAIL_CHOSEN_RGBA)
+            self._add_gl(gl.GLLinePlotItem(pos=pts, color=cols, width=3.5, antialias=True))
 
-            # Direction arrowhead + label at the destination end.
+            # Direction arrowhead + altitude-tagged label at the nose.
             ox, oy = flight.origin_km
             dx, dy = flight.destination_km
             arrow = self._arrowhead(pts[-1], ox, oy, dx, dy)
             self._add_gl(gl.GLLinePlotItem(
-                pos=arrow, color=_flight_color_gl(i), width=2.5, mode="lines"
+                pos=arrow, color=fcolor, width=2.5, mode="lines"
             ))
-            label_pos = (float(pts[-1][0]), float(pts[-1][1]), float(pts[-1][2]) + 30.0)
-            self._add_label(label_pos, f"Airplane {i + 1}", i)
+            tag = f"Airplane {i + 1}  FL{opt_fl}"
+            if chosen is not None and chosen_idx == 0:
+                tag += " (kept)"
+            self._add_label(
+                (float(pts[-1][0]), float(pts[-1][1]), float(pts[-1][2]) + 26.0),
+                tag, fqcolor, size=8,
+            )
 
         self.gl_view.setCameraPosition(
             distance=max(g.x_max_km - g.x_min_km, 1200), elevation=22, azimuth=-60
@@ -488,6 +508,11 @@ class MainWindow(QMainWindow):
     def _on_scenario_changed(self, _value: int) -> None:
         self._refresh_scene(self._build_cfg(), chosen=None)
 
+    def _on_randomize(self) -> None:
+        # A fresh seed re-rolls headings, altitudes, and ISSR placement. Setting
+        # the spin box fires valueChanged -> _on_scenario_changed -> rebuild.
+        self.seed_spin.setValue(random.randint(0, 9999))
+
     def _on_fl_changed(self, _text: str) -> None:
         self._render_map()  # only the 2D heatmap layer depends on the chosen FL
 
@@ -518,13 +543,34 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, resp: object) -> None:
         choices = resp.choices  # type: ignore[attr-defined]
+
+        # Redraw with the chosen options first — this also rebuilds self._flights,
+        # which we then read to report the initial vs optimized altitude.
+        chosen = {c.flight_name: c.chosen_option for c in choices}
+        if self._pending_cfg is not None:
+            self._refresh_scene(self._pending_cfg, chosen=chosen)
+        specs_by_name = {f.name: enumerate_option_specs(f) for f in self._flights}
+
         self.table.setRowCount(len(choices))
         for row, c in enumerate(choices):
-            self.table.setItem(row, 0, QTableWidgetItem(c.flight_name))
+            specs = specs_by_name.get(c.flight_name)
+            if specs:
+                init_fl = specs[0].profile.segments[0].fl
+                idx = max(0, min(c.chosen_option, len(specs) - 1))
+                opt_fl = specs[idx].profile.segments[0].fl
+            else:
+                init_fl = opt_fl = 0
+            try:
+                airplane = f"Airplane {int(c.flight_name[1:])}"
+            except ValueError:
+                airplane = c.flight_name
+            self.table.setItem(row, 0, QTableWidgetItem(airplane))
             self.table.setItem(row, 1, QTableWidgetItem(str(c.chosen_option)))
-            self.table.setItem(row, 2, QTableWidgetItem(f"{c.fuel_kg:.0f}"))
-            self.table.setItem(row, 3, QTableWidgetItem(str(c.contrail_cells)))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{c.disruption_flmin:.1f}"))
+            self.table.setItem(row, 2, QTableWidgetItem(f"FL{init_fl}"))
+            self.table.setItem(row, 3, QTableWidgetItem(f"FL{opt_fl}"))
+            self.table.setItem(row, 4, QTableWidgetItem(f"{c.fuel_kg:.0f}"))
+            self.table.setItem(row, 5, QTableWidgetItem(str(c.contrail_cells)))
+            self.table.setItem(row, 6, QTableWidgetItem(f"{c.disruption_flmin:.1f}"))
 
         self.status_label.setText(
             f"objective = {resp.objective:.2f}   "  # type: ignore[attr-defined]
@@ -533,11 +579,6 @@ class MainWindow(QMainWindow):
             f"conflicts = {resp.n_conflicts}   "  # type: ignore[attr-defined]
             f"options = {resp.n_options_total}"  # type: ignore[attr-defined]
         )
-
-        # Redraw with the chosen options (original vs optimized) on the same scene.
-        chosen = {c.flight_name: c.chosen_option for c in choices}
-        if self._pending_cfg is not None:
-            self._refresh_scene(self._pending_cfg, chosen=chosen)
         self.solve_btn.setEnabled(True)
 
     def _on_failed(self, message: str) -> None:
