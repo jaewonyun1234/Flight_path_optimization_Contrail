@@ -15,6 +15,7 @@ message ScenarioConfig {
   double snapshot_window_s = 8;   // upper bound of departure window (lower = 0)
   double time_limit_s = 9;        // CP-SAT time limit
   string progress_topic = 10;     // ZMQ topic to publish progress on
+  double issr_threshold = 11;     // RHi-excess above which a cell forms a contrail
 }
 
 message FlightChoice {

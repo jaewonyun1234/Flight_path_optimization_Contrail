@@ -59,6 +59,10 @@ def build_world_and_flights(cfg: solver_pb2.ScenarioConfig) -> tuple[World, list
       * its own baseline cruise flight level.
     """
     world = default_european_world(seed=cfg.seed, n_issr_blobs=cfg.n_issr_blobs)
+    # Threshold drives what counts as a contrail (cell RHi-excess > threshold),
+    # so it affects the solve, not just the picture. 0 means "use the default".
+    if cfg.issr_threshold > 0:
+        world.issr.threshold = float(cfg.issr_threshold)
     flights = build_random_flights(
         n_flights=cfg.n_flights,
         world=world,

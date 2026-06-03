@@ -82,10 +82,15 @@ _SUB_HEAD_START_S = 0.25
 _VSCALE = 6.0
 _FL_CENTER = 370.0
 
-# Trajectory colors.
+# Baseline (original-plan) line color. Where any path forms a contrail, that
+# segment is drawn as a LIGHTER tint of its own color (see _lighten).
 _BASELINE_RGBA = (0.82, 0.82, 0.9, 0.6)          # light gray = original plan
-_CONTRAIL_BASELINE_RGBA = (0.9, 0.45, 0.45, 0.75)
-_CONTRAIL_CHOSEN_RGBA = (1.0, 0.12, 0.12, 1.0)   # bright red = forming a contrail
+
+
+def _lighten(rgba, frac: float = 0.6):
+    """Blend a color toward white by `frac` (alpha unchanged)."""
+    r, g, b, a = rgba
+    return (r + (1.0 - r) * frac, g + (1.0 - g) * frac, b + (1.0 - b) * frac, a)
 
 
 def _flight_color_gl(i: int) -> tuple[float, float, float, float]:
@@ -201,6 +206,12 @@ class MainWindow(QMainWindow):
         self.time_spin.setSingleStep(1.0)
         self.time_spin.setValue(10.0)
 
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setRange(0.05, 1.0)
+        self.threshold_spin.setSingleStep(0.05)
+        self.threshold_spin.setValue(0.3)
+        self.threshold_spin.valueChanged.connect(self._on_scenario_changed)
+
         self.fl_combo = QComboBox()
         self.fl_combo.addItems(["FL340", "FL360", "FL380", "FL400"])
         self.fl_combo.setCurrentText("FL360")
@@ -221,6 +232,7 @@ class MainWindow(QMainWindow):
         form.addRow("Flights", self.flights_spin)
         form.addRow("ISSR blobs", self.blobs_spin)
         form.addRow("Contrail weight (beta)", self.beta_spin)
+        form.addRow("Contrail threshold (RHi)", self.threshold_spin)
         form.addRow("Time limit (s)", self.time_spin)
         form.addRow("2D map flight level", self.fl_combo)
         form.addRow(self.random_btn)
@@ -259,8 +271,9 @@ class MainWindow(QMainWindow):
         self.gl_view.setCameraPosition(distance=1700, elevation=22, azimuth=-60)
         gl_note = QLabel(
             "Drag to rotate, scroll to zoom.  Vertical = flight level (exaggerated).  "
-            "Faint gray = original plan, bright = optimized.  "
-            "Red = passing through a contrail zone.  Orange cloud = ISSR (denser = stronger)."
+            "Gray = original plan, bright = optimized; a segment turns lighter where it "
+            "forms a contrail.  Orange ellipsoids = ISSR zones (bright dense core, the "
+            "edge sits at the contrail threshold)."
         )
         gl_note.setWordWrap(True)
         gl_panel = QVBoxLayout()
@@ -310,6 +323,7 @@ class MainWindow(QMainWindow):
             corridor_frac=CORRIDOR_FRAC,
             snapshot_window_s=SNAPSHOT_WINDOW_S,
             time_limit_s=self.time_spin.value(),
+            issr_threshold=self.threshold_spin.value(),
             progress_topic=topic,
         )
 
@@ -379,8 +393,9 @@ class MainWindow(QMainWindow):
             [to_scene(x, y, m_to_fl(z)) for (x, y, z, _t) in waypoints], dtype=float
         )
 
-    def _vertex_colors(self, waypoints, normal_rgba, contrail_rgba) -> np.ndarray:
+    def _vertex_colors(self, waypoints, normal_rgba) -> np.ndarray:
         issr = self._world.issr
+        contrail_rgba = _lighten(normal_rgba)
         return np.array(
             [contrail_rgba if issr.is_inside(x, y, z) else normal_rgba
              for (x, y, z, _t) in waypoints],
@@ -423,7 +438,7 @@ class MainWindow(QMainWindow):
         grid.translate(0, 0, (340 - _FL_CENTER) * _VSCALE)
         self._add_gl(grid)
 
-        self._add_issr_cloud(to_scene)
+        self._add_issr_blobs(to_scene)
 
         gray = pg.mkColor((210, 210, 230))
         for i, flight in enumerate(self._flights):
@@ -440,9 +455,7 @@ class MainWindow(QMainWindow):
             if chosen is not None and chosen_idx != 0:
                 base_wps = waypoints_for(flight, specs[0].profile, sample_dt_s=30.0)
                 base_pts = self._line_points(to_scene, base_wps)
-                base_cols = self._vertex_colors(
-                    base_wps, _BASELINE_RGBA, _CONTRAIL_BASELINE_RGBA
-                )
+                base_cols = self._vertex_colors(base_wps, _BASELINE_RGBA)
                 self._add_gl(gl.GLLinePlotItem(
                     pos=base_pts, color=base_cols, width=2.0, antialias=True
                 ))
@@ -455,7 +468,7 @@ class MainWindow(QMainWindow):
             # Optimized (chosen) path in the flight's bright color.
             wps = waypoints_for(flight, specs[chosen_idx].profile, sample_dt_s=30.0)
             pts = self._line_points(to_scene, wps)
-            cols = self._vertex_colors(wps, fcolor, _CONTRAIL_CHOSEN_RGBA)
+            cols = self._vertex_colors(wps, fcolor)
             self._add_gl(gl.GLLinePlotItem(pos=pts, color=cols, width=3.5, antialias=True))
 
             # Direction arrowhead + altitude-tagged label at the nose.
@@ -477,32 +490,51 @@ class MainWindow(QMainWindow):
             distance=max(g.x_max_km - g.x_min_km, 1200), elevation=22, azimuth=-60
         )
 
-    def _add_issr_cloud(self, to_scene) -> None:
-        """ISSR zones as a glowing point cloud, denser/brighter where RHi is high."""
+    def _add_issr_blobs(self, to_scene) -> None:
+        """Each ISSR as a translucent ellipsoid with a bright, dense Gaussian core.
+
+        Concentric shells drawn additively make the center glow brightest and
+        fade outward. The outer shell sits at the RHi-excess threshold surface,
+        so raising/lowering the threshold visibly shrinks/grows each blob.
+        """
         issr = self._world.issr
-        rng = np.random.default_rng(0)
-        pts: list[tuple[float, float, float]] = []
-        cols: list[tuple[float, float, float, float]] = []
+        threshold = max(1e-3, float(issr.threshold))
+        # (radius as a fraction of the threshold surface, RGB, alpha)
+        shells = [
+            (0.45, (1.0, 0.88, 0.6), 0.30),   # bright dense core
+            (0.72, (1.0, 0.55, 0.22), 0.16),
+            (1.0, (1.0, 0.4, 0.12), 0.08),     # faint edge at the threshold
+        ]
         for blob in issr.blobs:
-            n = 300
-            xs = rng.normal(blob.cx_km, blob.sigma_h_km * 1.2, n)
-            ys = rng.normal(blob.cy_km, blob.sigma_h_km * 1.2, n)
-            zs = rng.normal(blob.cz_m, blob.sigma_v_m * 1.2, n)
-            for x, y, zm in zip(xs, ys, zs, strict=True):
-                rhi = issr.rhi_excess(float(x), float(y), float(zm))
-                if rhi < 0.08:
-                    continue  # skip faint wisps
-                w = min(1.0, rhi)
-                alpha = min(0.55, 0.1 + rhi * 0.5)
-                fl = max(330, min(410, m_to_fl(zm)))
-                pts.append(to_scene(float(x), float(y), fl))
-                cols.append((1.0, 0.45 + 0.45 * w, 0.15 + 0.5 * w, alpha))
-        if pts:
-            cloud = gl.GLScatterPlotItem(
-                pos=np.array(pts, dtype=float), color=np.array(cols, dtype=float), size=7.0
+            intensity = max(1e-3, blob.intensity)
+            if threshold < intensity:
+                r_thr = math.sqrt(max(0.2, -2.0 * math.log(threshold / intensity)))
+            else:
+                r_thr = 0.4  # whole blob below threshold; show a faint nub
+            r_thr = min(r_thr, 3.0)
+
+            center = to_scene(blob.cx_km, blob.cy_km, m_to_fl(blob.cz_m))
+            sigma_h = blob.sigma_h_km
+            sigma_v_scene = (blob.sigma_v_m / 30.48) * _VSCALE  # m -> FL -> scene
+            for frac, rgb, alpha in shells:
+                rad = frac * r_thr
+                scale = (rad * sigma_h, rad * sigma_h, rad * sigma_v_scene)
+                self._add_ellipsoid(center, scale, (rgb[0], rgb[1], rgb[2], alpha))
+
+    def _add_ellipsoid(self, center, scale, color) -> None:
+        md = gl.MeshData.sphere(rows=10, cols=20)
+        verts = md.vertexes() * np.asarray(scale, dtype=float) + np.asarray(center, dtype=float)
+        mesh = gl.MeshData(vertexes=verts, faces=md.faces())
+        try:
+            item = gl.GLMeshItem(
+                meshdata=mesh, smooth=True, color=color,
+                shader="balloon", glOptions="additive",
             )
-            cloud.setGLOptions("additive")  # overlapping points glow = denser cores
-            self._add_gl(cloud)
+        except Exception:
+            item = gl.GLMeshItem(
+                meshdata=mesh, smooth=True, color=color, glOptions="translucent"
+            )
+        self._add_gl(item)
 
     # ---------------------------------------------------------------- slots ---
     def _on_scenario_changed(self, _value: int) -> None:
