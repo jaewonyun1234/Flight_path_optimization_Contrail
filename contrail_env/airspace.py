@@ -199,7 +199,7 @@ class Sector:
     capacity: int                # max aircraft per (sector, time bucket)
 
 
-@dataclass
+@dataclass(frozen=True)
 class SectorMap:
     """
     Container for all sectors in a planning region.
@@ -225,9 +225,8 @@ class SectorMap:
                     iz_hi = min(self.grid.n_alts - 1, iz_hi)
                     # A sector covers ALL time buckets in its xy/z region.
                     cs[ix, iy, iz_lo:iz_hi+1, :] = s_idx
-        # Use object.__setattr__ because @dataclass + frozen-ish init.
-        # We're not actually frozen so plain assignment works:
-        self._cell_to_sector = cs
+        # Use object.__setattr__ because @dataclass is  frozen.
+        object.__setattr__(self, '_cell_to_sector', cs)
 
     def sector_at(self, ix: int, iy: int, iz: int, it: int) -> int:
         """Return sector index for a given cell, or -1 if uncovered."""
