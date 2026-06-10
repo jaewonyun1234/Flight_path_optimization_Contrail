@@ -101,6 +101,32 @@ from .solver_cpsat import (
     CPSATResult, solve_cpsat, enumerate_optimum,
 )
 
+# Quantum solver core (shared by Pasqal + Xanadu pipelines)
+from .quantum_common import (
+    BackendBudgetError, OptionGraph, QuantumResult,
+    build_option_graph, repair_sample, sample_is_feasible,
+    penalized_energy, evaluate_samples,
+)
+
+# Pasqal neutral-atom analog pipeline
+from .pasqal_analog import (
+    AnnealSchedule, RydbergStatevector,
+    solve_pasqal_analog, pulser_available,
+)
+
+# Xanadu photonic GBS pipeline
+from .xanadu_gbs import (
+    GBSEncoding, GBSSubsetSampler,
+    encode_option_graph, hafnian, takagi_symmetric,
+    solve_xanadu_gbs, strawberryfields_available,
+)
+
+# Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
+from .benchmark import (
+    BenchmarkReport, InstanceResult, SolverRun, SolverStats,
+    run_benchmark, default_scenario_factory, bootstrap_ci,
+)
+
 __all__ = [
     # Units
     "M_PER_FT", "FT_PER_M", "M_PER_NM", "NM_PER_KM",
@@ -134,4 +160,18 @@ __all__ = [
     "is_feasible", "cost_of_assignment", "brute_force_optimum",
     # CP-SAT solver
     "CPSATResult", "solve_cpsat", "enumerate_optimum",
+    # Quantum core
+    "BackendBudgetError", "OptionGraph", "QuantumResult",
+    "build_option_graph", "repair_sample", "sample_is_feasible",
+    "penalized_energy", "evaluate_samples",
+    # Pasqal
+    "AnnealSchedule", "RydbergStatevector",
+    "solve_pasqal_analog", "pulser_available",
+    # Xanadu
+    "GBSEncoding", "GBSSubsetSampler",
+    "encode_option_graph", "hafnian", "takagi_symmetric",
+    "solve_xanadu_gbs", "strawberryfields_available",
+    # Benchmark
+    "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
+    "run_benchmark", "default_scenario_factory", "bootstrap_ci",
 ]

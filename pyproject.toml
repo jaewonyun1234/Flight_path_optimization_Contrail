@@ -29,6 +29,15 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.4",
 ]
+# Real quantum SDK backends. The pipelines run WITHOUT these (built-in
+# statevector / exact-hafnian samplers); installing them switches
+# pasqal_analog to Pulser's QuTiP emulator and xanadu_gbs to Strawberry
+# Fields' gaussian backend automatically (backend="auto").
+quantum = [
+    "pulser>=0.21",
+    "pulser-simulation>=0.21",
+    "strawberryfields>=0.23",
+]
 
 [project.urls]
 Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail"
