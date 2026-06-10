@@ -2,19 +2,21 @@
 app.py — Researcher-focused analytical dashboard for the contrail QUBO pipeline.
 
 This is NOT a geographic / animation view. It analyzes the *problem* and the
-*classical solver*: the live CP-SAT convergence stream, the conflict-graph
-topology, the assembled QUBO matrix, and the cost trade-offs of the chosen
-options. Quantum backends are future work, so everything here is about the
-QUBO encoding and the CP-SAT ground-truth solve.
+*solvers*: the live CP-SAT convergence stream, the conflict-graph topology,
+the assembled QUBO matrix, the cost trade-offs of the chosen options, and the
+head-to-head quantum benchmark (CP-SAT vs Pasqal analog vs Xanadu GBS).
 
 DATA FLOW
 =========
-* The solve runs on the gRPC server; the GUI reaches it through SolveWorker
-  (a QThread) and streams progress over ZMQ — the UI never blocks.
+* The CP-SAT solve runs on the gRPC server; the GUI reaches it through
+  SolveWorker (a QThread) and streams progress over ZMQ — the UI never blocks.
 * The server returns only the solution, so the dashboard rebuilds the QUBO and
   conflict graph LOCALLY from the same (seeded) ScenarioConfig via
   service.scenario.build_scenario_full + contrail_env.assemble_qubo. Because the
   scenario is fully seeded, the reconstruction matches what the server solved.
+* The quantum benchmark (tab 5) runs IN-PROCESS in a worker thread: the
+  quantum samplers live in contrail_env (pasqal_analog, xanadu_gbs) and the
+  protocol in contrail_env.benchmark — no service round-trip needed.
 
 PANELS
 ======
@@ -24,6 +26,10 @@ PANELS
                                and a heatmap of |Q|.
 4. Trade-off results table   — chosen option per flight with fuel / contrail /
                                disruption, to read off the alpha,beta,gamma trade.
+5. Quantum benchmark         — plan §10 protocol over N seeds: approximation
+                               ratios with bootstrap CIs, raw feasibility rates,
+                               wall clocks, and live convergence curves for the
+                               Pasqal BO loop and the Xanadu GBS sampler.
 """
 
 from __future__ import annotations
@@ -56,6 +62,7 @@ from PyQt6.QtWidgets import (
 )
 
 from contrail_env import assemble_qubo
+from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
 from service.client import DEFAULT_SERVER_ADDRESS, SolverClient
 from service.generated import solver_pb2
 from service.progress import DEFAULT_SUB_ADDRESS, subscribe
@@ -68,6 +75,17 @@ SNAPSHOT_WINDOW_S = 300.0
 _SUB_HEAD_START_S = 0.25
 
 _MONO = QFont("Consolas", 10)
+
+
+def _mean_best_cost(instances, solver: str) -> str:
+    """Mean best cost of one solver across the benchmark instances."""
+    costs = [
+        run.best_cost
+        for inst in instances
+        for run in inst.runs
+        if run.solver == solver and run.status == "OK"
+    ]
+    return f"{np.mean(costs):.1f}" if costs else "—"
 
 
 # =============================================================================
@@ -125,6 +143,59 @@ class SolveWorker(QThread):
 
 
 # =============================================================================
+# BENCHMARK WORKER — runs the plan §10 protocol locally, off the UI thread
+# =============================================================================
+
+class BenchmarkWorker(QThread):
+    """One full benchmark sweep: CP-SAT vs Pasqal vs Xanadu over N seeds.
+
+    The scenario factory reuses the SAME seeded construction as the rest of
+    the dashboard (service.scenario.build_scenario_full), so the instances
+    benchmarked here are exactly the ones the other tabs display.
+    """
+
+    progress = pyqtSignal(str, int, float)   # solver, step, best cost so far
+    cell_done = pyqtSignal(int, object)      # seed, contrail_env.benchmark.SolverRun
+    finished_ok = pyqtSignal(object)         # contrail_env.benchmark.BenchmarkReport
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        cfg: solver_pb2.ScenarioConfig,
+        seeds: list[int],
+        n_shots: int,
+        bo_iters: int,
+    ) -> None:
+        super().__init__()
+        self._cfg = cfg
+        self._seeds = seeds
+        self._n_shots = n_shots
+        self._bo_iters = bo_iters
+
+    def run(self) -> None:
+        def factory(seed: int):
+            cfg = solver_pb2.ScenarioConfig()
+            cfg.CopyFrom(self._cfg)
+            cfg.seed = seed
+            _world, _flights, evals, conflicts, buckets = build_scenario_full(cfg)
+            return evals, conflicts, buckets
+
+        try:
+            report = run_benchmark(
+                factory,
+                seeds=self._seeds,
+                n_shots=self._n_shots,
+                bo_iters=self._bo_iters,
+                on_progress=lambda solver, step, cost: self.progress.emit(solver, step, cost),
+                on_result=lambda seed, cell: self.cell_done.emit(seed, cell),
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished_ok.emit(report)
+
+
+# =============================================================================
 # MAIN WINDOW
 # =============================================================================
 
@@ -134,6 +205,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Contrail QUBO Dashboard — CP-SAT ground truth")
 
         self._worker: SolveWorker | None = None
+        self._bench_worker: BenchmarkWorker | None = None
         self._pending_cfg: solver_pb2.ScenarioConfig | None = None
 
         self._xs: list[int] = []
@@ -217,6 +289,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_graph_tab(), "2 · Conflict graph")
         self.tabs.addTab(self._build_qubo_tab(), "3 · QUBO analytics")
         self.tabs.addTab(self._build_results_tab(), "4 · Trade-offs")
+        self.tabs.addTab(self._build_benchmark_tab(), "5 · Quantum benchmark")
 
         root = QHBoxLayout()
         root.addWidget(left_widget)
@@ -284,6 +357,118 @@ class MainWindow(QMainWindow):
         )
         self.results.horizontalHeader().setStretchLastSection(True)
         return self.results
+
+    def _build_benchmark_tab(self) -> QWidget:
+        # --- controls row ----------------------------------------------------
+        self.bench_seeds_spin = QSpinBox()
+        self.bench_seeds_spin.setRange(1, 10)
+        self.bench_seeds_spin.setValue(3)
+
+        self.bench_shots_spin = QSpinBox()
+        self.bench_shots_spin.setRange(100, 5000)
+        self.bench_shots_spin.setSingleStep(100)
+        self.bench_shots_spin.setValue(1000)
+
+        self.bench_bo_spin = QSpinBox()
+        self.bench_bo_spin.setRange(5, 40)
+        self.bench_bo_spin.setValue(12)
+
+        self.bench_btn = QPushButton("Run benchmark")
+        self.bench_btn.clicked.connect(self._on_run_benchmark)
+
+        self.bench_status = QLabel(
+            "idle — runs CP-SAT, Pasqal analog-QAOA, and Xanadu GBS on the "
+            "current instance over N seeds (seed, seed+1, …)"
+        )
+        self.bench_status.setFont(_MONO)
+
+        controls = QHBoxLayout()
+        for label, widget in (
+            ("Seeds", self.bench_seeds_spin),
+            ("Samples / shots", self.bench_shots_spin),
+            ("BO iterations", self.bench_bo_spin),
+        ):
+            controls.addWidget(QLabel(label))
+            controls.addWidget(widget)
+        controls.addWidget(self.bench_btn)
+        controls.addWidget(self.bench_status, stretch=1)
+
+        # --- aggregate table ---------------------------------------------------
+        self.bench_table = QTableWidget(len(SOLVER_NAMES), 7)
+        self.bench_table.setHorizontalHeaderLabels([
+            "Solver", "Backend", "E_best (mean)", "Approx ratio r",
+            "r 95% CI", "Raw feas %", "Wall (ms)",
+        ])
+        self.bench_table.horizontalHeader().setStretchLastSection(True)
+        self.bench_table.verticalHeader().setVisible(False)
+        for row, name in enumerate(SOLVER_NAMES):
+            self.bench_table.setItem(row, 0, QTableWidgetItem(name))
+
+        # --- approximation-ratio bar chart -------------------------------------
+        self.bench_bars = pg.PlotWidget(
+            title="Approximation ratio r = E*/E (mean, bootstrap 95% CI)"
+        )
+        self.bench_bars.setLabel("left", "r (1.0 = proven optimum)")
+        self.bench_bars.showGrid(y=True, alpha=0.3)
+        axis = self.bench_bars.getAxis("bottom")
+        axis.setTicks([[(i, name) for i, name in enumerate(SOLVER_NAMES)]])
+        self._bench_bar_item: pg.BarGraphItem | None = None
+        self._bench_err_item: pg.ErrorBarItem | None = None
+
+        # --- convergence plots ---------------------------------------------------
+        self.pasqal_plot = pg.PlotWidget(
+            title="Pasqal analog-QAOA — best repaired cost vs BO evaluation"
+        )
+        self.pasqal_plot.setLabel("bottom", "BO evaluation")
+        self.pasqal_plot.setLabel("left", "best combined cost")
+        self.pasqal_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.pasqal_curve = self.pasqal_plot.plot(
+            [], [], pen=pg.mkPen("m", width=2), symbol="o", symbolSize=6
+        )
+        self.pasqal_opt_line = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen("g", style=Qt.PenStyle.DashLine)
+        )
+        self.pasqal_plot.addItem(self.pasqal_opt_line)
+
+        self.xanadu_plot = pg.PlotWidget(
+            title="Xanadu GBS — best repaired cost vs samples"
+        )
+        self.xanadu_plot.setLabel("bottom", "samples drawn")
+        self.xanadu_plot.setLabel("left", "best combined cost")
+        self.xanadu_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.xanadu_curve = self.xanadu_plot.plot(
+            [], [], pen=pg.mkPen("y", width=2), symbol="o", symbolSize=6
+        )
+        self.xanadu_opt_line = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen("g", style=Qt.PenStyle.DashLine)
+        )
+        self.xanadu_plot.addItem(self.xanadu_opt_line)
+
+        self._bench_curves: dict[str, tuple[list[int], list[float]]] = {
+            "pasqal-analog": ([], []),
+            "xanadu-gbs": ([], []),
+        }
+
+        # --- layout ---------------------------------------------------------
+        mid = QHBoxLayout()
+        mid.addWidget(self.bench_table, stretch=3)
+        mid.addWidget(self.bench_bars, stretch=2)
+        mid_w = QWidget()
+        mid_w.setLayout(mid)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.pasqal_plot)
+        bottom.addWidget(self.xanadu_plot)
+        bottom_w = QWidget()
+        bottom_w.setLayout(bottom)
+
+        root = QVBoxLayout()
+        root.addLayout(controls)
+        root.addWidget(mid_w, stretch=2)
+        root.addWidget(bottom_w, stretch=3)
+        wrap = QWidget()
+        wrap.setLayout(root)
+        return wrap
 
     # ---------------------------------------------------------------- config --
     def _build_cfg(self, topic: str = "") -> solver_pb2.ScenarioConfig:
@@ -470,6 +655,130 @@ class MainWindow(QMainWindow):
     def _on_failed(self, message: str) -> None:
         self.summary.setText(f"solve failed:\n{message}")
         self.solve_btn.setEnabled(True)
+
+    # ----------------------------------------------------------- benchmark ---
+    def _on_run_benchmark(self) -> None:
+        if self._bench_worker is not None and self._bench_worker.isRunning():
+            return
+
+        base_seed = self.seed_spin.value()
+        seeds = [base_seed + k for k in range(self.bench_seeds_spin.value())]
+
+        for xs, ys in self._bench_curves.values():
+            xs.clear()
+            ys.clear()
+        self.pasqal_curve.setData([], [])
+        self.xanadu_curve.setData([], [])
+        for row in range(self.bench_table.rowCount()):
+            for col in range(1, self.bench_table.columnCount()):
+                self.bench_table.setItem(row, col, QTableWidgetItem("…"))
+
+        self.bench_status.setText(f"running seeds {seeds} …")
+        self.bench_btn.setEnabled(False)
+
+        self._bench_worker = BenchmarkWorker(
+            cfg=self._build_cfg(),
+            seeds=seeds,
+            n_shots=self.bench_shots_spin.value(),
+            bo_iters=self.bench_bo_spin.value(),
+        )
+        self._bench_worker.progress.connect(self._on_bench_progress)
+        self._bench_worker.cell_done.connect(self._on_bench_cell)
+        self._bench_worker.finished_ok.connect(self._on_bench_done)
+        self._bench_worker.failed.connect(self._on_bench_failed)
+        self._bench_worker.start()
+
+    def _on_bench_progress(self, solver: str, step: int, cost: float) -> None:
+        if solver not in self._bench_curves:
+            return
+        xs, ys = self._bench_curves[solver]
+        xs.append(step)
+        ys.append(cost)
+        curve = self.pasqal_curve if solver == "pasqal-analog" else self.xanadu_curve
+        curve.setData(xs, ys)
+        self.bench_status.setText(f"{solver}  step {step}  best {cost:.1f}")
+
+    def _on_bench_cell(self, seed: int, cell: object) -> None:
+        # CP-SAT finishing marks the start of a new instance: reset the
+        # quantum convergence curves and pin the optimum reference lines.
+        if cell.solver == "cpsat":  # type: ignore[attr-defined]
+            for xs, ys in self._bench_curves.values():
+                xs.clear()
+                ys.clear()
+            self.pasqal_curve.setData([], [])
+            self.xanadu_curve.setData([], [])
+            optimum = cell.best_cost  # type: ignore[attr-defined]
+            self.pasqal_opt_line.setValue(optimum)
+            self.xanadu_opt_line.setValue(optimum)
+            self.bench_status.setText(f"seed {seed}:  E* = {optimum:.1f}  (CP-SAT)")
+
+    def _on_bench_done(self, report: object) -> None:
+        stats = report.aggregate()  # type: ignore[attr-defined]
+        instances = report.instances  # type: ignore[attr-defined]
+
+        # Backend / note per solver from the most recent instance.
+        latest: dict[str, object] = {}
+        for inst in instances:
+            for run in inst.runs:
+                latest[run.solver] = run
+
+        means: list[float] = []
+        err_low: list[float] = []
+        err_high: list[float] = []
+        for row, name in enumerate(SOLVER_NAMES):
+            s = stats.get(name)
+            run = latest.get(name)
+            backend = getattr(run, "backend", "-")
+            if s is not None:
+                values = [
+                    backend,
+                    _mean_best_cost(instances, name),
+                    f"{s.ratio_mean:.4f}",
+                    f"[{s.ratio_ci_low:.4f}, {s.ratio_ci_high:.4f}]",
+                    f"{100 * s.feasibility_mean:.1f}",
+                    f"{1000 * s.wall_clock_mean_s:.0f}",
+                ]
+                means.append(s.ratio_mean)
+                err_low.append(s.ratio_mean - s.ratio_ci_low)
+                err_high.append(s.ratio_ci_high - s.ratio_mean)
+            else:
+                note = getattr(run, "note", "no data")
+                status = getattr(run, "status", "—")
+                values = [backend, "—", "—", "—", "—", f"{status}: {note}"]
+                means.append(0.0)
+                err_low.append(0.0)
+                err_high.append(0.0)
+            for col, val in enumerate(values, start=1):
+                self.bench_table.setItem(row, col, QTableWidgetItem(str(val)))
+
+        # Ratio bars with bootstrap CIs.
+        if self._bench_bar_item is not None:
+            self.bench_bars.removeItem(self._bench_bar_item)
+        if self._bench_err_item is not None:
+            self.bench_bars.removeItem(self._bench_err_item)
+        x = np.arange(len(SOLVER_NAMES))
+        self._bench_bar_item = pg.BarGraphItem(
+            x=x, height=means, width=0.55, brush=(80, 160, 220, 180)
+        )
+        self._bench_err_item = pg.ErrorBarItem(
+            x=x, y=np.array(means),
+            top=np.array(err_high), bottom=np.array(err_low),
+            beam=0.18, pen=pg.mkPen("w", width=2),
+        )
+        self.bench_bars.addItem(self._bench_bar_item)
+        self.bench_bars.addItem(self._bench_err_item)
+        self.bench_bars.setYRange(min(0.95, min(m for m in means if m > 0) - 0.02), 1.01)
+
+        n_inst = len(instances)
+        self.bench_status.setText(
+            f"done — {n_inst} seed(s) × {len(SOLVER_NAMES)} solvers; "
+            f"green dashed line = CP-SAT optimum E* of the last seed"
+        )
+        self.bench_btn.setEnabled(True)
+
+    def _on_bench_failed(self, message: str) -> None:
+        self.bench_status.setText(f"benchmark failed: {message}")
+        self.bench_btn.setEnabled(True)
 
 
 def main() -> None:
