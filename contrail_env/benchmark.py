@@ -53,6 +53,10 @@ ScenarioFactory = Callable[
 ]
 ProgressCallback = Callable[[str, int, float], None]
 ResultCallback = Callable[[int, "SolverRun"], None]
+# Liveness heartbeat: (message, fraction of the CURRENT solver cell in [0, 1]).
+# Fires much more often than on_progress — ~20x per Schrödinger integration —
+# so a GUI can prove the sweep is alive even when one BO eval takes minutes.
+PhaseCallback = Callable[[str, float], None]
 
 SOLVER_NAMES = ("cpsat", "pasqal-analog", "xanadu-gbs")
 
@@ -224,6 +228,7 @@ def _run_instance(
     xanadu_backend: str,
     on_progress: ProgressCallback | None,
     on_result: ResultCallback | None,
+    on_phase: PhaseCallback | None,
 ) -> InstanceResult:
     """Steps 1-5 of the §10.1 protocol on one instance."""
     instance = InstanceResult(
@@ -240,6 +245,8 @@ def _run_instance(
             on_result(seed, run)
 
     # --- 1. CP-SAT ground truth -----------------------------------------
+    if on_phase is not None:
+        on_phase(f"seed {seed}: CP-SAT proving the optimum ({len(evals)} options)", 0.0)
     cpsat_history: list[tuple[int, float]] = []
 
     def cpsat_progress(improvement: int, objective: float) -> None:
@@ -273,12 +280,17 @@ def _run_instance(
         if on_progress is not None:
             on_progress("pasqal-analog", step, cost)
 
+    def pasqal_phase(message: str, frac: float) -> None:
+        if on_phase is not None:
+            on_phase(f"seed {seed}: Pasqal {message}", frac)
+
     try:
         t0 = time.perf_counter()
         pasqal = solve_pasqal_analog(
             evals, conflicts, buckets,
             n_shots=n_shots, bo_iters=bo_iters, seed=seed,
             backend=pasqal_backend, on_progress=pasqal_progress,
+            on_phase=pasqal_phase,
         )
         emit(_quantum_to_run(pasqal, instance.optimum, time.perf_counter() - t0))
     except BackendBudgetError as exc:
@@ -290,6 +302,11 @@ def _run_instance(
     def xanadu_progress(step: int, cost: float) -> None:
         if on_progress is not None:
             on_progress("xanadu-gbs", step, cost)
+        if on_phase is not None:
+            on_phase(
+                f"seed {seed}: GBS sampling {step}/{n_shots} subsets",
+                min(1.0, step / n_shots),
+            )
 
     try:
         t0 = time.perf_counter()
@@ -318,15 +335,19 @@ def run_benchmark(
     xanadu_backend: str = "auto",
     on_progress: ProgressCallback | None = None,
     on_result: ResultCallback | None = None,
+    on_phase: PhaseCallback | None = None,
 ) -> BenchmarkReport:
     """Run the full §10.1 protocol over the given seeds.
 
-    Callbacks (both optional, used by the GUI):
+    Callbacks (all optional, used by the GUI):
         on_progress(solver, step, best_cost_so_far) — live convergence;
-        on_result(seed, run)                        — one finished cell.
+        on_result(seed, run)                        — one finished cell;
+        on_phase(message, cell_fraction)            — liveness heartbeat.
     """
     report = BenchmarkReport()
     for seed in seeds:
+        if on_phase is not None:
+            on_phase(f"seed {seed}: building the instance", 0.0)
         evals, conflicts, buckets = factory(seed)
         report.instances.append(_run_instance(
             seed, evals, conflicts, buckets,
@@ -337,6 +358,7 @@ def run_benchmark(
             xanadu_backend=xanadu_backend,
             on_progress=on_progress,
             on_result=on_result,
+            on_phase=on_phase,
         ))
     return report
 

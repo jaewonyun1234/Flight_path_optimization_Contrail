@@ -42,7 +42,7 @@ from collections import OrderedDict
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -52,6 +52,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -63,6 +64,7 @@ from PyQt6.QtWidgets import (
 
 from contrail_env import assemble_qubo
 from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
+from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
 from service.client import DEFAULT_SERVER_ADDRESS, SolverClient
 from service.generated import solver_pb2
 from service.progress import DEFAULT_SUB_ADDRESS, subscribe
@@ -156,6 +158,7 @@ class BenchmarkWorker(QThread):
 
     progress = pyqtSignal(str, int, float)   # solver, step, best cost so far
     cell_done = pyqtSignal(int, object)      # seed, contrail_env.benchmark.SolverRun
+    phase = pyqtSignal(str, float)           # heartbeat: message, cell fraction [0,1]
     finished_ok = pyqtSignal(object)         # contrail_env.benchmark.BenchmarkReport
     failed = pyqtSignal(str)
 
@@ -188,6 +191,7 @@ class BenchmarkWorker(QThread):
                 bo_iters=self._bo_iters,
                 on_progress=lambda solver, step, cost: self.progress.emit(solver, step, cost),
                 on_result=lambda seed, cell: self.cell_done.emit(seed, cell),
+                on_phase=lambda message, frac: self.phase.emit(message, float(frac)),
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -207,6 +211,11 @@ class MainWindow(QMainWindow):
         self._worker: SolveWorker | None = None
         self._bench_worker: BenchmarkWorker | None = None
         self._pending_cfg: solver_pb2.ScenarioConfig | None = None
+
+        # Benchmark progress state (see _on_bench_phase / _refresh_bench_status).
+        self._bench_t0 = 0.0
+        self._bench_cells_done = 0
+        self._bench_msg = ""
 
         self._xs: list[int] = []
         self._ys: list[float] = []
@@ -382,6 +391,19 @@ class MainWindow(QMainWindow):
         )
         self.bench_status.setFont(_MONO)
 
+        # Overall sweep progress: 100 units per (seed, solver) cell, with the
+        # heartbeat filling the current cell fractionally — so the bar moves
+        # even during a single multi-minute Schrödinger integration.
+        self.bench_progress = QProgressBar()
+        self.bench_progress.setRange(0, 1)
+        self.bench_progress.setValue(0)
+        self.bench_progress.setFormat("%p%")
+        self.bench_progress.setFixedWidth(220)
+
+        self._bench_timer = QTimer(self)
+        self._bench_timer.setInterval(1000)
+        self._bench_timer.timeout.connect(self._refresh_bench_status)
+
         controls = QHBoxLayout()
         for label, widget in (
             ("Seeds", self.bench_seeds_spin),
@@ -391,6 +413,7 @@ class MainWindow(QMainWindow):
             controls.addWidget(QLabel(label))
             controls.addWidget(widget)
         controls.addWidget(self.bench_btn)
+        controls.addWidget(self.bench_progress)
         controls.addWidget(self.bench_status, stretch=1)
 
         # --- aggregate table ---------------------------------------------------
@@ -673,7 +696,23 @@ class MainWindow(QMainWindow):
             for col in range(1, self.bench_table.columnCount()):
                 self.bench_table.setItem(row, col, QTableWidgetItem("…"))
 
-        self.bench_status.setText(f"running seeds {seeds} …")
+        # Progress bar: 100 units per (seed, solver) cell.
+        self.bench_progress.setRange(0, len(seeds) * len(SOLVER_NAMES) * 100)
+        self.bench_progress.setValue(0)
+        self._bench_cells_done = 0
+        self._bench_t0 = time.monotonic()
+
+        # Honest expectations up front: the statevector cost is 2^n.
+        n_q = len(self._evals)
+        if n_q > MAX_STATEVECTOR_QUBITS:
+            hint = f" — {n_q} qubits > {MAX_STATEVECTOR_QUBITS}-qubit cap: Pasqal row will be SKIPPED"
+        elif n_q >= 17:
+            hint = f" — {n_q} qubits: each Pasqal BO eval integrates 2^{n_q} amplitudes (minutes!)"
+        else:
+            hint = ""
+        self._bench_msg = f"running seeds {seeds}{hint}"
+        self._refresh_bench_status()
+        self._bench_timer.start()
         self.bench_btn.setEnabled(False)
 
         self._bench_worker = BenchmarkWorker(
@@ -684,9 +723,23 @@ class MainWindow(QMainWindow):
         )
         self._bench_worker.progress.connect(self._on_bench_progress)
         self._bench_worker.cell_done.connect(self._on_bench_cell)
+        self._bench_worker.phase.connect(self._on_bench_phase)
         self._bench_worker.finished_ok.connect(self._on_bench_done)
         self._bench_worker.failed.connect(self._on_bench_failed)
         self._bench_worker.start()
+
+    def _refresh_bench_status(self) -> None:
+        elapsed = int(time.monotonic() - self._bench_t0)
+        self.bench_status.setText(
+            f"{self._bench_msg}   [{elapsed // 60}:{elapsed % 60:02d} elapsed]"
+        )
+
+    def _on_bench_phase(self, message: str, frac: float) -> None:
+        self._bench_msg = message
+        self.bench_progress.setValue(
+            self._bench_cells_done * 100 + int(100 * min(1.0, max(0.0, frac)))
+        )
+        self._refresh_bench_status()
 
     def _on_bench_progress(self, solver: str, step: int, cost: float) -> None:
         if solver not in self._bench_curves:
@@ -696,9 +749,12 @@ class MainWindow(QMainWindow):
         ys.append(cost)
         curve = self.pasqal_curve if solver == "pasqal-analog" else self.xanadu_curve
         curve.setData(xs, ys)
-        self.bench_status.setText(f"{solver}  step {step}  best {cost:.1f}")
+        self._bench_msg = f"{solver}  step {step}  best {cost:.1f}"
+        self._refresh_bench_status()
 
     def _on_bench_cell(self, seed: int, cell: object) -> None:
+        self._bench_cells_done += 1
+        self.bench_progress.setValue(self._bench_cells_done * 100)
         # CP-SAT finishing marks the start of a new instance: reset the
         # quantum convergence curves and pin the optimum reference lines.
         if cell.solver == "cpsat":  # type: ignore[attr-defined]
@@ -710,7 +766,8 @@ class MainWindow(QMainWindow):
             optimum = cell.best_cost  # type: ignore[attr-defined]
             self.pasqal_opt_line.setValue(optimum)
             self.xanadu_opt_line.setValue(optimum)
-            self.bench_status.setText(f"seed {seed}:  E* = {optimum:.1f}  (CP-SAT)")
+            self._bench_msg = f"seed {seed}:  E* = {optimum:.1f}  (CP-SAT)"
+            self._refresh_bench_status()
 
     def _on_bench_done(self, report: object) -> None:
         stats = report.aggregate()  # type: ignore[attr-defined]
@@ -769,14 +826,19 @@ class MainWindow(QMainWindow):
         self.bench_bars.addItem(self._bench_err_item)
         self.bench_bars.setYRange(min(0.95, min(m for m in means if m > 0) - 0.02), 1.01)
 
+        self._bench_timer.stop()
+        self.bench_progress.setValue(self.bench_progress.maximum())
+        elapsed = int(time.monotonic() - self._bench_t0)
         n_inst = len(instances)
         self.bench_status.setText(
-            f"done — {n_inst} seed(s) × {len(SOLVER_NAMES)} solvers; "
-            f"green dashed line = CP-SAT optimum E* of the last seed"
+            f"done in {elapsed // 60}:{elapsed % 60:02d} — {n_inst} seed(s) × "
+            f"{len(SOLVER_NAMES)} solvers; green dashed line = CP-SAT optimum E* "
+            f"of the last seed"
         )
         self.bench_btn.setEnabled(True)
 
     def _on_bench_failed(self, message: str) -> None:
+        self._bench_timer.stop()
         self.bench_status.setText(f"benchmark failed: {message}")
         self.bench_btn.setEnabled(True)
 

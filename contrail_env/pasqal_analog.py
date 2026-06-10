@@ -166,12 +166,23 @@ class RydbergStatevector:
         self._detune_load = detune_load
         self._inter = inter
 
-    def run(self, schedule: AnnealSchedule, n_steps: int = 500) -> np.ndarray:
-        """Evolve |00...0> under H(t) and return the 2^n outcome probabilities."""
+    def run(
+        self,
+        schedule: AnnealSchedule,
+        n_steps: int = 500,
+        on_step: Callable[[int, int], None] | None = None,
+    ) -> np.ndarray:
+        """Evolve |00...0> under H(t) and return the 2^n outcome probabilities.
+
+        `on_step(steps_done, n_steps)` fires every ~5% of the integration —
+        a liveness heartbeat for callers (one evolution at 19-20 qubits takes
+        minutes, and without this there is no sign of life in between).
+        """
         n = self.n
         dt = (schedule.T_ns / 1000.0) / n_steps  # us; energies are rad/us
         psi = np.zeros(1 << n, dtype=np.complex128)
         psi[0] = 1.0
+        stride = max(1, n_steps // 20)
 
         for k in range(n_steps):
             s = (k + 0.5) / n_steps
@@ -189,6 +200,8 @@ class RydbergStatevector:
                 block[:, 0, :] = c * a + ms * b
                 block[:, 1, :] = ms * a + c * b
             psi *= half_phase
+            if on_step is not None and (k + 1) % stride == 0:
+                on_step(k + 1, n_steps)
 
         probs = np.abs(psi) ** 2
         return probs / probs.sum()
@@ -335,6 +348,7 @@ def solve_pasqal_analog(
     seed: int = 0,
     backend: str = "auto",
     on_progress: Callable[[int, float], None] | None = None,
+    on_phase: Callable[[str, float], None] | None = None,
 ) -> QuantumResult:
     """Analog-QAOA + Bayesian optimization for the flight-option QUBO.
 
@@ -345,6 +359,10 @@ def solve_pasqal_analog(
 
     `on_progress(iteration, best_repaired_cost_so_far)` fires once per BO
     evaluation — this is the convergence curve of plan §10.3.
+
+    `on_phase(message, fraction_done)` is a fine-grained liveness heartbeat:
+    it fires ~20 times per Schrödinger integration, so callers (the GUI) can
+    show progress even when a single BO evaluation takes minutes.
     """
     t0 = time.perf_counter()
     rng = np.random.default_rng(seed)
@@ -385,6 +403,23 @@ def solve_pasqal_analog(
             on_progress(iteration, best_cost)
         return evaluation.best_cost
 
+    # One Schrödinger evolution = 1/(bo_iters + 1) of the work (the +1 is
+    # the final high-statistics run). `evals_done` positions the heartbeat.
+    def evolve(schedule: AnnealSchedule, label: str, evals_done: int) -> np.ndarray:
+        assert sim is not None
+        if on_phase is None:
+            return sim.run(schedule, n_steps=n_steps)
+        emit_phase = on_phase
+
+        def heartbeat(step: int, total: int) -> None:
+            frac = (evals_done + step / total) / (bo_iters + 1)
+            emit_phase(
+                f"{label}: integrating {graph.n}-qubit dynamics, step {step}/{total}",
+                frac,
+            )
+
+        return sim.run(schedule, n_steps=n_steps, on_step=heartbeat)
+
     def objective(params: np.ndarray) -> float:
         schedule = AnnealSchedule(
             T_ns=float(params[0]),
@@ -393,12 +428,17 @@ def solve_pasqal_analog(
             delta_final=float(params[3]),
         )
         if use_pulser:
+            if on_phase is not None:
+                on_phase(
+                    f"BO eval {iteration + 1}/{bo_iters}: Pulser/QuTiP emulation",
+                    iteration / (bo_iters + 1),
+                )
             samples = _pulser_sample(graph, schedule, shots=200)
             consume(samples)
             from .quantum_common import penalized_energy
             return float(np.mean([penalized_energy(graph, s) for s in samples]))
         assert sim is not None and energy_vec is not None
-        probs = sim.run(schedule, n_steps=n_steps)
+        probs = evolve(schedule, f"BO eval {iteration + 1}/{bo_iters}", iteration)
         consume(_sample_bits(probs, graph.n, 256, rng))
         # Exact expectation <E_penalty>: smooth, deterministic BO signal.
         return float(probs @ energy_vec)
@@ -422,7 +462,7 @@ def solve_pasqal_analog(
         final_samples = _pulser_sample(graph, best_schedule, shots=n_shots)
     else:
         assert sim is not None
-        probs = sim.run(best_schedule, n_steps=n_steps)
+        probs = evolve(best_schedule, "final sampling at the best schedule", bo_iters)
         final_samples = _sample_bits(probs, graph.n, n_shots, rng)
 
     evaluation = evaluate_samples(graph, final_samples)
