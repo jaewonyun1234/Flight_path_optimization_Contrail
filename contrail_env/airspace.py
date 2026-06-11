@@ -216,11 +216,15 @@ class SectorMap:
     _cell_to_sector: np.ndarray = field(init=False)
 
     def __post_init__(self):
+        # -1 means "no sector owns this cell" (uncovered airspace).
         cs = np.full(self.grid.shape, -1, dtype=np.int32)
         for s_idx, sec in enumerate(self.sectors):
             for ix, iy in sec.xy_cells:
+                # Skip cells that fall outside the grid boundary.
                 if 0 <= ix < self.grid.nx and 0 <= iy < self.grid.ny:
                     iz_lo, iz_hi = sec.iz_range
+                    # Clamp to valid altitude indices in case the sector
+                    # definition extends beyond the grid's altitude range.
                     iz_lo = max(0, iz_lo)
                     iz_hi = min(self.grid.n_alts - 1, iz_hi)
                     # A sector covers ALL time buckets in its xy/z region.
