@@ -26,19 +26,39 @@ Strawberry Fields' gaussian backend automatically.
 ## Install
 
 ```
-pip install -e .
+pip install -e .                   # core: the headless solver service
+pip install -e ".[gui]"            # add the PyQt6 desktop dashboard
 bash scripts/gen_proto.sh          # Windows: .\scripts\gen_proto.ps1
 ```
 
-Requires Python 3.11+. The gRPC stubs are generated from `service/proto/solver.proto`,
-not committed.
+Requires Python 3.11+. Core deps are just the solver runtime (numpy, OR-Tools,
+gRPC, ZMQ); the Qt/OpenGL dashboard stack lives in the `gui` extra so the
+deployed server stays lean. The gRPC stubs are generated from
+`service/proto/solver.proto`, not committed.
 
 ## Run
 
 ```
 python -m service.server           # gRPC solver on localhost:50051
-python gui/app.py                  # dashboard, in a second terminal
+python gui/app.py                  # dashboard, in a second terminal ([gui] extra)
 ```
+
+## Docker
+
+The solver service is containerized (the headless gRPC server only — not the
+desktop GUI). The bind host is read from the environment, so the container
+binds `0.0.0.0` while local runs default to `localhost`.
+
+```
+docker compose up --build          # build + run; gRPC on :50051, progress on :5556
+# or, without compose:
+docker build -t contrail-solver .
+docker run --rm -p 50051:50051 -p 5556:5556 contrail-solver
+```
+
+Then run the dashboard on the host (`python gui/app.py`) and it talks to the
+containerized solver. CI builds the image and smoke-tests that it boots on
+every push.
 
 The dashboard has five panels: live CP-SAT convergence (over ZMQ), the conflict-graph
 topology, QUBO matrix statistics (size, sparsity, penalty constants), the

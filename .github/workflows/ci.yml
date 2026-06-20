@@ -31,3 +31,26 @@ jobs:
 
       - name: Pytest
         run: pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build solver image
+        run: docker build -t contrail-solver:ci .
+
+      - name: Smoke-test the server boots and accepts connections
+        run: |
+          docker run -d --name solver contrail-solver:ci
+          ok=0
+          for _ in $(seq 1 30); do
+            if docker exec solver python -c \
+              "import socket; socket.create_connection(('localhost', 50051), 2).close()"; then
+              echo "solver is up and accepting connections"; ok=1; break
+            fi
+            sleep 1
+          done
+          docker logs solver
+          docker rm -f solver
+          test "$ok" = 1

@@ -12,18 +12,25 @@ license = { text = "MIT" }
 authors = [{ name = "jaewonyun1234" }]
 keywords = ["optimization", "cp-sat", "contrails", "grpc", "zmq", "pyqt6"]
 
+# Core runtime = the headless solver service (gRPC + ZMQ). Deliberately does
+# NOT include the PyQt6 desktop dashboard so the deployed server image stays
+# small and free of GUI/X11 system dependencies. The dashboard pulls its deps
+# from the `gui` extra below.
 dependencies = [
     "numpy>=1.26",
     "ortools>=9.10",
     "grpcio>=1.60",
     "grpcio-tools>=1.60",
     "pyzmq>=25.0",
+]
+
+[project.optional-dependencies]
+# PyQt6 desktop dashboard (client side only). Install with: pip install -e ".[gui]"
+gui = [
     "PyQt6>=6.6",
     "pyqtgraph>=0.13",
     "PyOpenGL>=3.1",
 ]
-
-[project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "mypy>=1.8",
