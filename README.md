@@ -49,6 +49,27 @@ The solver service is containerized (the headless gRPC server only — not the
 desktop GUI). The bind host is read from the environment, so the container
 binds `0.0.0.0` while local runs default to `localhost`.
 
+### Pull the pre-built image (easiest)
+
+A Docker image is published to the GitHub Container Registry on every push to
+main. No cloning or building required — just Docker Desktop installed.
+
+```
+docker pull ghcr.io/jaewonyun1234/contrail-solver:latest
+docker run --rm -p 50051:50051 -p 5556:5556 ghcr.io/jaewonyun1234/contrail-solver:latest
+```
+
+Then run the dashboard on your machine:
+
+```
+pip install -e ".[gui]"
+python gui/app.py
+```
+
+The dashboard connects to the solver on `localhost:50051` automatically.
+
+### Build locally from source
+
 ```
 docker compose up --build          # build + run; gRPC on :50051, progress on :5556
 # or, without compose:
@@ -56,9 +77,8 @@ docker build -t contrail-solver .
 docker run --rm -p 50051:50051 -p 5556:5556 contrail-solver
 ```
 
-Then run the dashboard on the host (`python gui/app.py`) and it talks to the
-containerized solver. CI builds the image and smoke-tests that it boots on
-every push.
+CI builds the image, smoke-tests that the server boots, and publishes it to
+ghcr.io on every push to main.
 
 The dashboard has five panels: live CP-SAT convergence (over ZMQ), the conflict-graph
 topology, QUBO matrix statistics (size, sparsity, penalty constants), the
