@@ -54,3 +54,31 @@ jobs:
           docker logs solver
           docker rm -f solver
           test "$ok" = 1
+
+  docker-publish:
+    runs-on: ubuntu-latest
+    # Only publish on pushes to main — not on pull requests.
+    # Both the test suite AND the smoke-test must pass first.
+    needs: [lint-type-test, docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write   # needed to push to ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image to ghcr.io
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/contrail-solver:latest
+            ghcr.io/${{ github.repository_owner }}/contrail-solver:${{ github.sha }}
