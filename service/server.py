@@ -15,6 +15,7 @@ to an `on_progress` callback; Task 4 wires that callback to a ZMQ publisher.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Callable
 
 import grpc
@@ -173,7 +174,13 @@ async def serve_forever(
 
 
 def main() -> None:
-    asyncio.run(serve_forever())
+    # 12-factor config: read the bind address from the environment so the same
+    # image runs locally (defaults to localhost) and in a container (which sets
+    # CONTRAIL_GRPC_HOST=0.0.0.0 so the port is reachable from outside).
+    host = os.environ.get("CONTRAIL_GRPC_HOST", DEFAULT_HOST)
+    port = int(os.environ.get("CONTRAIL_GRPC_PORT", str(DEFAULT_PORT)))
+    progress_address = os.environ.get("CONTRAIL_PROGRESS_ADDRESS", DEFAULT_PUB_ADDRESS)
+    asyncio.run(serve_forever(host, port, progress_address))
 
 
 if __name__ == "__main__":
