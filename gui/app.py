@@ -42,7 +42,7 @@ from collections import OrderedDict
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -62,7 +62,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from contrail_env import assemble_qubo
+from contrail_env import assemble_qubo, fl_to_m, waypoints_for
 from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
 from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
 from service.client import DEFAULT_SERVER_ADDRESS, SolverClient
@@ -75,6 +75,9 @@ CORRIDOR_FRAC = 0.05
 SNAPSHOT_WINDOW_S = 300.0
 # Head start (seconds) for the SUB socket to connect before the solve emits.
 _SUB_HEAD_START_S = 0.25
+# Altitude (FL) of the horizontal slice the map heatmap shows. A 2-D map can
+# only show one altitude of the 3-D risk field; FL360 is the middle of the band.
+_MAP_SLICE_FL = 360
 
 _MONO = QFont("Consolas", 10)
 
@@ -225,6 +228,9 @@ class MainWindow(QMainWindow):
         self._conflicts: list = []
         self._groups: OrderedDict[str, list[int]] = OrderedDict()
         self._graph_texts: list[pg.TextItem] = []
+        # World + flights kept for the geographic map panel (tab 6).
+        self._world: object | None = None
+        self._flights: list = []
 
         self._build_ui()
         self._rebuild_structure(self._build_cfg())
@@ -299,6 +305,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_qubo_tab(), "3 · QUBO analytics")
         self.tabs.addTab(self._build_results_tab(), "4 · Trade-offs")
         self.tabs.addTab(self._build_benchmark_tab(), "5 · Quantum benchmark")
+        self.tabs.addTab(self._build_map_tab(), "6 · Map")
 
         root = QHBoxLayout()
         root.addWidget(left_widget)
@@ -493,6 +500,120 @@ class MainWindow(QMainWindow):
         wrap.setLayout(root)
         return wrap
 
+    def _build_map_tab(self) -> QWidget:
+        # A real geographic panel: predicted ISSR risk over Europe with the
+        # solved routes drawn on top. setAspectLocked because it's a map.
+        self.map_plot = pg.PlotWidget(title="Map — geographic ISSR risk + routes")
+        self.map_plot.setLabel("bottom", "lon")
+        self.map_plot.setLabel("left", "lat")
+        self.map_plot.setAspectLocked(True)
+        self.map_plot.showGrid(x=True, y=True, alpha=0.2)
+
+        self.map_heat = pg.ImageItem()
+        try:
+            self.map_heat.setColorMap(pg.colormap.get("inferno"))  # warm = higher risk
+        except Exception:
+            pass
+        self.map_plot.addItem(self.map_heat)
+
+        # Two route layers, drawn with NaN-separated polylines (connect="finite"):
+        # context routes (pre-solve / baseline) muted, chosen routes green.
+        self.map_routes_context = pg.PlotCurveItem(
+            pen=pg.mkPen((170, 170, 180, 130), width=1), connect="finite"
+        )
+        self.map_routes_chosen = pg.PlotCurveItem(
+            pen=pg.mkPen((40, 220, 90), width=2), connect="finite"
+        )
+        self.map_plot.addItem(self.map_routes_context)
+        self.map_plot.addItem(self.map_routes_chosen)
+        return self.map_plot
+
+    def _active_anchor(self, field):
+        """The GeoAnchor placing this ISSR field on the map.
+
+        The MLIssrField carries its own anchor; the synthetic field has none,
+        so we place it with the SAME canonical anchor the model/features use,
+        so synthetic and ml render over the same European box.
+        """
+        anchor = getattr(field, "anchor", None)
+        if anchor is not None:
+            return anchor
+        from contrail_ml.config import DEFAULT_CONFIG
+
+        return DEFAULT_CONFIG.anchor
+
+    def _render_map(self, chosen_by_flight: dict[str, int] | None) -> None:
+        """Draw the ISSR-risk heatmap + flight routes over real geography.
+
+        Works for BOTH the synthetic ISSRField and the MLIssrField, since they
+        share the rhi_excess_grid / mask_grid interface. On a 2-D map the
+        altitude dimension collapses, so each flight is one ground track; once
+        solved, chosen routes are drawn green over the muted context.
+        """
+        if self._world is None:
+            return
+        field = self._world.issr
+        anchor = self._active_anchor(field)
+        g = self._world.grid
+
+        # --- risk heatmap on a local (x_km, y_km) slice at a fixed altitude ---
+        nx, ny = 120, 80
+        xs = np.linspace(g.x_min_km, g.x_max_km, nx)
+        ys = np.linspace(g.y_min_km, g.y_max_km, ny)
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+        zz = np.full_like(xx, fl_to_m(_MAP_SLICE_FL))
+        risk = np.asarray(field.rhi_excess_grid(xx, yy, zz), dtype=float)
+
+        # The local->geo transform is mildly nonlinear (lon depends on lat), so
+        # we place the image on its lon/lat bounding box — a small-angle
+        # approximation that matches the (exactly transformed) routes closely
+        # over this 1500x800 km box.
+        lons, lats = anchor.local_to_geo(xx, yy)
+        lon_min, lon_max = float(np.min(lons)), float(np.max(lons))
+        lat_min, lat_max = float(np.min(lats)), float(np.max(lats))
+        self.map_heat.setImage(risk, autoLevels=True)
+        self.map_heat.setRect(QRectF(lon_min, lat_min, lon_max - lon_min, lat_max - lat_min))
+
+        # --- routes: one ground track per flight (chosen profile or baseline) ---
+        ctx_lon: list[np.ndarray] = []
+        ctx_lat: list[np.ndarray] = []
+        cho_lon: list[np.ndarray] = []
+        cho_lat: list[np.ndarray] = []
+        for flight in self._flights:
+            profile = flight.baseline
+            is_chosen = False
+            if chosen_by_flight and flight.name in chosen_by_flight:
+                members = self._groups.get(flight.name, [])
+                k = chosen_by_flight[flight.name]
+                if 0 <= k < len(members):
+                    profile = self._evals[members[k]].profile
+                    is_chosen = True
+            wps = waypoints_for(flight, profile)
+            wx = np.array([w[0] for w in wps], dtype=float)
+            wy = np.array([w[1] for w in wps], dtype=float)
+            lon, lat = anchor.local_to_geo(wx, wy)
+            # NaN terminator so consecutive flights aren't joined by the curve.
+            lon = np.append(np.asarray(lon, dtype=float), np.nan)
+            lat = np.append(np.asarray(lat, dtype=float), np.nan)
+            if is_chosen:
+                cho_lon.append(lon)
+                cho_lat.append(lat)
+            else:
+                ctx_lon.append(lon)
+                ctx_lat.append(lat)
+
+        self.map_routes_context.setData(
+            np.concatenate(ctx_lon) if ctx_lon else [],
+            np.concatenate(ctx_lat) if ctx_lat else [],
+        )
+        self.map_routes_chosen.setData(
+            np.concatenate(cho_lon) if cho_lon else [],
+            np.concatenate(cho_lat) if cho_lat else [],
+        )
+
+        source = getattr(field, "source", "synthetic")
+        self.map_plot.setTitle(f"Map — ISSR: {source}  (risk slice at FL{_MAP_SLICE_FL})")
+
     # ---------------------------------------------------------------- config --
     def _build_cfg(self, topic: str = "") -> solver_pb2.ScenarioConfig:
         return solver_pb2.ScenarioConfig(
@@ -513,12 +634,14 @@ class MainWindow(QMainWindow):
     def _rebuild_structure(self, cfg: solver_pb2.ScenarioConfig) -> None:
         """Rebuild the QUBO + conflict graph locally and refresh panels 2 & 3."""
         try:
-            _world, _flights, evals, conflicts, buckets = build_scenario_full(cfg)
+            world, flights, evals, conflicts, buckets = build_scenario_full(cfg)
             qubo = assemble_qubo(evals, conflicts, buckets)
         except Exception as exc:
             self.summary.setText(f"instance build failed:\n{exc}")
             return
 
+        self._world = world
+        self._flights = flights
         self._evals = evals
         self._conflicts = conflicts
         groups: OrderedDict[str, list[int]] = OrderedDict()
@@ -528,6 +651,7 @@ class MainWindow(QMainWindow):
 
         self._render_conflict_graph(set())
         self._render_qubo(qubo, len(conflicts), len(buckets))
+        self._render_map(None)
         self.summary.setText(
             f"instance ready\n"
             f"F={len(groups)}  options={qubo.n_options}\n"
@@ -672,6 +796,9 @@ class MainWindow(QMainWindow):
             if members and 0 <= c.chosen_option < len(members):
                 chosen_idx.add(members[c.chosen_option])
         self._render_conflict_graph(chosen_idx)
+
+        # Draw the chosen routes (green) over the risk map.
+        self._render_map({c.flight_name: c.chosen_option for c in choices})
 
         self.solve_btn.setEnabled(True)
 
