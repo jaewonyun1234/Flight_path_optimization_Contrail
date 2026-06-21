@@ -28,8 +28,12 @@ venv/
 .venv/
 .env
 
-# contrail_ml artifacts — the server image never needs MLflow runs, versioned
-# datasets, or trained model files (and the [ml] extra isn't installed anyway).
+# contrail_ml is excluded entirely — ML training/inference is a separate concern
+# with its own heavy deps (scipy/sklearn/xgboost/mlflow). The server image has
+# one job: run the CP-SAT gRPC service. ML runs offline in its own environment.
+contrail_ml/
+
+# contrail_ml artifacts
 mlruns/
 data/processed/
 *.joblib
