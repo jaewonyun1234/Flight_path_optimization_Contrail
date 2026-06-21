@@ -79,13 +79,12 @@ Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail
 # is intentionally NOT listed (it is gitignored); the editable install exposes
 # the `service` directory so the generated subpackage imports fine once built.
 # ---------------------------------------------------------------------------
-[tool.setuptools]
-packages = [
-    "contrail_env",
-    "service",
-    "contrail_ml",
-    "contrail_ml.data",
-]
+[tool.setuptools.packages.find]
+# Auto-discover packages present in the build context. Locally this finds
+# contrail_env, service, contrail_ml, and contrail_ml.data. Inside the Docker
+# build context, contrail_ml is excluded via .dockerignore so only
+# contrail_env and service are found — pip install . succeeds either way.
+where = ["."]
 
 # ---------------------------------------------------------------------------
 # Ruff — lint the code we add in this layer. The nine pre-existing
