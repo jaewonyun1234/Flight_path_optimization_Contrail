@@ -7,6 +7,15 @@ into the existing optimizer untouched.
 
 import warnings
 
+import pytest
+
+# Needs the [ml] extra (pandas/scipy/scikit-learn/xgboost). The core lint-type-test
+# CI job installs only [dev], so skip there; the dedicated `ml` job runs these fully.
+pytest.importorskip("pandas")
+pytest.importorskip("scipy")
+pytest.importorskip("sklearn")
+pytest.importorskip("xgboost")
+
 from contrail_env import (
     build_and_evaluate_flight,
     build_capacity_buckets,

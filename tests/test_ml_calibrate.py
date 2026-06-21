@@ -1,6 +1,11 @@
 """Calibration: isotonic lowers ECE; conformal interval covers ~(1-alpha)."""
 
 import numpy as np
+import pytest
+
+# Needs the [ml] extra (scikit-learn). The core lint-type-test CI job installs
+# only [dev], so skip there; the dedicated `ml` job installs [ml] and runs these.
+pytest.importorskip("sklearn")
 
 from contrail_ml.calibrate import (
     ConformalRHi,
