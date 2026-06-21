@@ -84,8 +84,9 @@ The dashboard has six tabs: live CP-SAT convergence (over ZMQ), the conflict-gra
 topology, QUBO matrix statistics (size, sparsity, penalty constants), the
 chosen-option trade-offs, the quantum benchmark (CP-SAT vs Pasqal vs Xanadu over
 N seeds, with live convergence curves for the BO loop and the GBS sampler), and a
-geographic map — the predicted ISSR risk as a density overlay on a real
-Plotly/MapLibre basemap with the chosen vs context routes drawn on top.
+geographic map — the predicted ISSR risk as a marker overlay on a real Plotly
+`geo` basemap (country borders / coastlines, drawn with SVG and bundled offline
+vectors, so it needs no WebGL or network) with the chosen vs context routes on top.
 
 The benchmark also runs headless:
 

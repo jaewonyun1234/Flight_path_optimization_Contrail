@@ -26,7 +26,7 @@ pytest.importorskip("plotly")
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from contrail_env import build_random_flights, default_european_world  # noqa: E402
-from gui.app import MainWindow, RouteLine, build_map_figure  # noqa: E402
+from gui.app import MainWindow, RouteLine, _geo_assets_script, build_map_figure  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +40,7 @@ def qapp():
 # Pure figure builder — no Qt, no web view.                                    #
 # --------------------------------------------------------------------------- #
 
-def test_build_map_figure_has_density_and_route_traces():
+def test_build_map_figure_has_risk_and_route_traces():
     lon, lat = np.meshgrid(np.linspace(-2, 18, 20), np.linspace(43, 50, 15), indexing="ij")
     risk = np.abs(np.sin(lon) * np.cos(lat))
     routes = [
@@ -49,9 +49,11 @@ def test_build_map_figure_has_density_and_route_traces():
     ]
     fig = build_map_figure(source="synthetic", lon=lon, lat=lat, risk=risk, routes=routes)
 
-    types = [t.type for t in fig.data]
-    assert types.count("densitymap") == 1      # the ISSR overlay
-    assert types.count("scattermap") == 2      # one trace per route
+    # SVG `geo` traces (no WebGL): one marker overlay for risk + one line per route.
+    assert all(t.type == "scattergeo" for t in fig.data)
+    modes = [t.mode for t in fig.data]
+    assert modes.count("markers") == 1   # the ISSR risk overlay
+    assert modes.count("lines") == 2     # one trace per route
     # The figure must serialise to a self-contained page (this is what the
     # web view loads); inlined plotly.js makes it well over the setHtml limit.
     html = fig.to_html(include_plotlyjs="inline", full_html=True)
@@ -62,7 +64,15 @@ def test_build_map_figure_handles_empty_routes():
     lon, lat = np.meshgrid(np.linspace(0, 10, 8), np.linspace(44, 49, 6), indexing="ij")
     fig = build_map_figure(source="synthetic", lon=lon, lat=lat,
                            risk=np.zeros_like(lon), routes=[])
-    assert [t.type for t in fig.data] == ["densitymap"]
+    # Only the (empty, all-clear-sky) risk overlay; no routes.
+    assert [t.mode for t in fig.data] == ["markers"]
+
+
+def test_geo_basemap_is_bundled_offline():
+    # The country/coastline vectors must ship in-repo and inline into the page,
+    # so the geo map renders with no CDN / network (locked-down corporate boxes).
+    script = _geo_assets_script()
+    assert script and "world_50m" in script and "PlotlyGeoAssets" in script
 
 
 # --------------------------------------------------------------------------- #

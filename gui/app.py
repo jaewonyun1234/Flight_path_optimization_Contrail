@@ -5,7 +5,7 @@ Tabs 1-5 analyze the *problem* and the *solvers*: the live CP-SAT convergence
 stream, the conflict-graph topology, the assembled QUBO matrix, the cost
 trade-offs of the chosen options, and the head-to-head quantum benchmark (CP-SAT
 vs Pasqal analog vs Xanadu GBS). Tab 6 is the one geographic view: the predicted
-ISSR risk over Europe with the solved routes drawn on a real basemap.
+ISSR risk over Europe with the solved routes drawn on a real (offline) basemap.
 
 DATA FLOW
 =========
@@ -31,9 +31,11 @@ PANELS
                                ratios with bootstrap CIs, raw feasibility rates,
                                wall clocks, and live convergence curves for the
                                Pasqal BO loop and the Xanadu GBS sampler.
-6. Geographic map            — Plotly/MapLibre basemap with the ISSR risk as a
-                               density overlay and the chosen vs context routes
-                               (embedded QtWebEngine view; needs the [gui] extra).
+6. Geographic map            — Plotly `geo` basemap (real country borders /
+                               coastlines, SVG so no WebGL, offline vectors) with
+                               the ISSR risk as an Inferno marker overlay and the
+                               chosen vs context routes; embedded QtWebEngine view
+                               (needs the [gui] extra).
 """
 
 from __future__ import annotations
@@ -46,15 +48,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-
-# MapLibre GL (Plotly's map backend) requires WebGL. QtWebEngine's embedded
-# Chromium often has GPU acceleration blocked by default on Windows — force
-# SwiftShader (Chromium's built-in software WebGL renderer) so the map always
-# works regardless of GPU driver / blacklist. Must be set before any Qt import.
-os.environ.setdefault(
-    "QTWEBENGINE_CHROMIUM_FLAGS",
-    "--disable-gpu --enable-unsafe-swiftshader --ignore-gpu-blocklist",
-)
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
@@ -106,15 +100,45 @@ _SUB_HEAD_START_S = 0.25
 # Altitude (FL) of the horizontal slice the map heatmap shows. A 2-D map can
 # only show one altitude of the 3-D risk field; FL360 is the middle of the band.
 _MAP_SLICE_FL = 360
-# MapLibre basemap. A dark canvas makes the warm inferno ISSR overlay glow; it
-# needs no API token. Tiles stream from the web — offline it falls back to a
-# plain dark canvas, and the overlay + routes still render correctly.
-_MAP_BASEMAP = "carto-darkmatter"
-# Density-overlay grid resolution (lon x lat samples) and blur radius (px).
-_MAP_GRID_NX, _MAP_GRID_NY = 130, 90
-_MAP_DENSITY_RADIUS = 22
+# The map uses Plotly's `geo` subplot: real country borders + coastlines drawn
+# with SVG (D3), NOT WebGL. This renders everywhere — including locked-down /
+# headless Chromium where WebGL (MapLibre/Mapbox tile maps) is unavailable — and
+# needs no map tiles or internet (Natural Earth vectors ship with plotly.js).
+# Risk grid resolution (lon x lat samples) for the marker-cloud overlay, the
+# marker size (px), and the fraction-of-max below which a cell is "clear sky"
+# and skipped so the basemap stays visible.
+_MAP_GRID_NX, _MAP_GRID_NY = 100, 68
+_MAP_MARKER_SIZE = 9
+_MAP_RISK_FLOOR_FRAC = 0.04
+# Bundled Natural Earth vectors for the geo basemap (see _geo_assets_script).
+_GEO_TOPOJSON_NAME = "world_50m"
+_GEO_ASSET_PATH = Path(__file__).resolve().parent / "assets" / f"{_GEO_TOPOJSON_NAME}.json"
+_GEO_ASSET_CACHE: str | None = None
 
 _MONO = QFont("Consolas", 10)
+
+
+def _geo_assets_script() -> str:
+    """Inline the basemap topojson so the geo map needs no CDN / network.
+
+    Plotly's geo subplot otherwise fetches its country/coastline vectors from
+    cdn.plot.ly at render time. Injecting them into window.PlotlyGeoAssets (which
+    plotly.js reads on load) makes the map fully offline — important on locked-
+    down networks. Returns "" if the bundled asset is absent, leaving plotly to
+    fall back to the CDN.
+    """
+    global _GEO_ASSET_CACHE
+    if _GEO_ASSET_CACHE is None:
+        try:
+            _GEO_ASSET_CACHE = _GEO_ASSET_PATH.read_text(encoding="utf-8")
+        except OSError:
+            _GEO_ASSET_CACHE = ""
+    if not _GEO_ASSET_CACHE:
+        return ""
+    return (
+        "<script>window.PlotlyGeoAssets=window.PlotlyGeoAssets||{topojson:{}};"
+        f'window.PlotlyGeoAssets.topojson["{_GEO_TOPOJSON_NAME}"]={_GEO_ASSET_CACHE};</script>'
+    )
 
 
 def _mean_best_cost(instances, solver: str) -> str:
@@ -150,12 +174,16 @@ def build_map_figure(
     risk: np.ndarray,
     routes: list[RouteLine],
 ):
-    """Build the geographic Map figure: ISSR density overlay + flight routes.
+    """Build the geographic Map figure: ISSR risk overlay + flight routes.
 
     Pure function of plain arrays so it carries no Qt/web dependency and can be
     unit-tested directly. `lon`/`lat`/`risk` are the (same-shape) sampled risk
-    field; `routes` are per-flight ground tracks already in lon/lat. Returns a
-    Plotly Figure positioned over the data's bounding box on a MapLibre basemap.
+    field; `routes` are per-flight ground tracks already in lon/lat.
+
+    Rendered on Plotly's `geo` subplot (SVG / Natural Earth vectors) rather than
+    a WebGL tile map, so it draws real country borders + coastlines and displays
+    even where WebGL is blocked (locked-down / headless Chromium). Returns a
+    Plotly Figure framed on the data's bounding box.
     """
     import plotly.graph_objects as go  # lazy: keep module import lean
 
@@ -165,17 +193,26 @@ def build_map_figure(
 
     fig = go.Figure()
 
-    # ISSR risk as a smooth density overlay. radius blurs the grid samples into
-    # a continuous field; only positive risk is drawn so clear sky stays clean.
+    # ISSR risk as an Inferno marker cloud over the basemap. `geo` has no native
+    # density trace, so we draw the grid samples as markers and skip near-zero
+    # "clear sky" cells, keeping the map readable where there's no risk.
+    rmax = float(np.nanmax(risk_f)) if risk_f.size else 0.0
+    keep = risk_f > (_MAP_RISK_FLOOR_FRAC * rmax) if rmax > 0 else np.zeros_like(risk_f, bool)
     fig.add_trace(
-        go.Densitymap(
-            lon=lon_f,
-            lat=lat_f,
-            z=risk_f,
-            radius=_MAP_DENSITY_RADIUS,
-            colorscale="Inferno",
-            opacity=0.55,
-            colorbar=dict(title="ISSR<br>risk", thickness=12, len=0.6, x=0.99),
+        go.Scattergeo(
+            lon=lon_f[keep],
+            lat=lat_f[keep],
+            mode="markers",
+            marker=dict(
+                size=_MAP_MARKER_SIZE,
+                color=risk_f[keep],
+                colorscale="Inferno",
+                cmin=0.0,
+                cmax=rmax if rmax > 0 else 1.0,
+                opacity=0.55,
+                line=dict(width=0),
+                colorbar=dict(title="ISSR<br>risk", thickness=12, len=0.6, x=0.99),
+            ),
             name="ISSR risk",
             hoverinfo="skip",
         )
@@ -184,23 +221,39 @@ def build_map_figure(
     # Routes: muted gray for context/baseline, bright green for the chosen plan.
     for r in routes:
         fig.add_trace(
-            go.Scattermap(
+            go.Scattergeo(
                 lon=np.asarray(r.lon, dtype=float),
                 lat=np.asarray(r.lat, dtype=float),
                 mode="lines",
                 line=dict(
                     width=3 if r.chosen else 1.5,
-                    color="#28dc5a" if r.chosen else "rgba(200,200,210,0.55)",
+                    color="#28dc5a" if r.chosen else "rgba(200,200,210,0.6)",
                 ),
                 name=f"{r.name} (chosen)" if r.chosen else r.name,
                 hovertemplate=f"{r.name}<extra></extra>",
             )
         )
 
-    center_lon = float(np.nanmean(lon_f)) if lon_f.size else 5.0
-    center_lat = float(np.nanmean(lat_f)) if lat_f.size else 46.5
+    # Frame the view on the data box with a small margin; dark land/ocean makes
+    # the warm risk cloud and green routes pop.
+    margin = 1.0
+    lon_lo = float(np.nanmin(lon_f)) - margin if lon_f.size else -6.0
+    lon_hi = float(np.nanmax(lon_f)) + margin if lon_f.size else 16.0
+    lat_lo = float(np.nanmin(lat_f)) - margin if lat_f.size else 42.0
+    lat_hi = float(np.nanmax(lat_f)) + margin if lat_f.size else 51.0
+    fig.update_geos(
+        projection_type="mercator",
+        resolution=50,
+        lonaxis_range=[lon_lo, lon_hi],
+        lataxis_range=[lat_lo, lat_hi],
+        showland=True, landcolor="#1a1b20",
+        showocean=True, oceancolor="#0b0c10",
+        showcountries=True, countrycolor="rgba(255,255,255,0.22)",
+        showcoastlines=True, coastlinecolor="rgba(255,255,255,0.3)",
+        showlakes=False,
+        bgcolor="#0e0e10",
+    )
     fig.update_layout(
-        map=dict(style=_MAP_BASEMAP, center=dict(lon=center_lon, lat=center_lat), zoom=4.0),
         margin=dict(l=0, r=0, t=34, b=0),
         title=dict(text=f"ISSR risk + routes — source: {source} (slice FL{_MAP_SLICE_FL})", x=0.5),
         paper_bgcolor="#0e0e10",
@@ -719,9 +772,13 @@ class MainWindow(QMainWindow):
 
         # Write a self-contained page (plotly.js inlined) and load it from disk —
         # setHtml caps payloads at ~2 MB, which the inlined library exceeds. A
-        # cache-busting query forces the view to re-read after each solve.
+        # cache-busting query forces the view to re-read after each solve. The
+        # basemap vectors are inlined into <head> so the geo map needs no CDN.
         html = fig.to_html(include_plotlyjs="inline", full_html=True,
                            config={"displayModeBar": True})
+        assets = _geo_assets_script()
+        if assets:
+            html = html.replace("</head>", assets + "</head>", 1)
         with open(self._map_html_path, "w", encoding="utf-8") as fh:
             fh.write(html)
         if self.map_view is not None:
