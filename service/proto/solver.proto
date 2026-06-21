@@ -21,6 +21,12 @@ message ScenarioConfig {
   string issr_source = 12;        // "synthetic" (default) or "ml"
   string issr_time = 13;          // ISO valid-time for the ML forecast (optional)
   double issr_p_threshold = 14;   // calibrated P(ISSR) cut for is_inside (0 -> default)
+  // Real historical-traffic source (contrail_flights / OpenSky). Default
+  // "" == "synthetic", so existing clients are unaffected. "real" pulls actual
+  // flown ADS-B tracks for the window below and reduces them to flights.
+  string flight_source = 15;      // "synthetic" (default) or "real"
+  string flight_start_time = 16;  // ISO start of the historical pull window
+  string flight_end_time = 17;    // ISO end of the historical pull window
 }
 
 message FlightChoice {

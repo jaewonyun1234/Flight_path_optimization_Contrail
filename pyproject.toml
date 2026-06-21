@@ -60,6 +60,15 @@ ml = [
     "matplotlib",        # reliability / diagnostic plots logged to MLflow
     "tabulate",          # markdown rendering of the comparison table for MLflow
 ]
+# Real historical-traffic loader (OpenSky). The package's geometry + reduction
+# run on numpy alone; this extra is only needed to actually PULL and CACHE real
+# tracks (pyopensky + the tabular stack). Like [ml], it is NOT in the core deps,
+# so the deployed solver image stays lean.
+flights = [
+    "pyopensky>=2.0",
+    "pandas>=2.0",
+    "pyarrow",
+]
 # Real quantum SDK backends. The pipelines run WITHOUT these (built-in
 # statevector / exact-hafnian samplers); installing them switches
 # pasqal_analog to Pulser's QuTiP emulator and xanadu_gbs to Strawberry
