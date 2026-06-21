@@ -1,10 +1,11 @@
 """
 app.py — Researcher-focused analytical dashboard for the contrail QUBO pipeline.
 
-This is NOT a geographic / animation view. It analyzes the *problem* and the
-*solvers*: the live CP-SAT convergence stream, the conflict-graph topology,
-the assembled QUBO matrix, the cost trade-offs of the chosen options, and the
-head-to-head quantum benchmark (CP-SAT vs Pasqal analog vs Xanadu GBS).
+Tabs 1-5 analyze the *problem* and the *solvers*: the live CP-SAT convergence
+stream, the conflict-graph topology, the assembled QUBO matrix, the cost
+trade-offs of the chosen options, and the head-to-head quantum benchmark (CP-SAT
+vs Pasqal analog vs Xanadu GBS). Tab 6 is the one geographic view: the predicted
+ISSR risk over Europe with the solved routes drawn on a real basemap.
 
 DATA FLOW
 =========
@@ -30,19 +31,25 @@ PANELS
                                ratios with bootstrap CIs, raw feasibility rates,
                                wall clocks, and live convergence curves for the
                                Pasqal BO loop and the Xanadu GBS sampler.
+6. Geographic map            — Plotly/MapLibre basemap with the ISSR risk as a
+                               density overlay and the chosen vs context routes
+                               (embedded QtWebEngine view; needs the [gui] extra).
 """
 
 from __future__ import annotations
 
+import os
 import random
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -62,6 +69,18 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+# QtWebEngine backs the geographic Map tab. It MUST be imported before any
+# QApplication is constructed (Qt sets up shared OpenGL contexts at import), so
+# it lives here at module scope, not lazily inside the tab. Degrades to a hint
+# label if the [gui] extra (PyQt6-WebEngine) isn't installed.
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+    _HAS_WEBENGINE = True
+except ImportError:  # pragma: no cover - exercised only without the extra
+    QWebEngineView = None  # type: ignore[assignment, misc]
+    _HAS_WEBENGINE = False
+
 from contrail_env import assemble_qubo, fl_to_m, waypoints_for
 from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
 from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
@@ -78,6 +97,13 @@ _SUB_HEAD_START_S = 0.25
 # Altitude (FL) of the horizontal slice the map heatmap shows. A 2-D map can
 # only show one altitude of the 3-D risk field; FL360 is the middle of the band.
 _MAP_SLICE_FL = 360
+# MapLibre basemap. A dark canvas makes the warm inferno ISSR overlay glow; it
+# needs no API token. Tiles stream from the web — offline it falls back to a
+# plain dark canvas, and the overlay + routes still render correctly.
+_MAP_BASEMAP = "carto-darkmatter"
+# Density-overlay grid resolution (lon x lat samples) and blur radius (px).
+_MAP_GRID_NX, _MAP_GRID_NY = 130, 90
+_MAP_DENSITY_RADIUS = 22
 
 _MONO = QFont("Consolas", 10)
 
@@ -91,6 +117,88 @@ def _mean_best_cost(instances, solver: str) -> str:
         if run.solver == solver and run.status == "OK"
     ]
     return f"{np.mean(costs):.1f}" if costs else "—"
+
+
+# =============================================================================
+# MAP FIGURE  (pure, no Qt — unit-testable on its own)
+# =============================================================================
+
+@dataclass(frozen=True)
+class RouteLine:
+    """One flight's ground track in geographic coordinates for the map."""
+
+    name: str
+    lon: np.ndarray
+    lat: np.ndarray
+    chosen: bool
+
+
+def build_map_figure(
+    *,
+    source: str,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    risk: np.ndarray,
+    routes: list[RouteLine],
+):
+    """Build the geographic Map figure: ISSR density overlay + flight routes.
+
+    Pure function of plain arrays so it carries no Qt/web dependency and can be
+    unit-tested directly. `lon`/`lat`/`risk` are the (same-shape) sampled risk
+    field; `routes` are per-flight ground tracks already in lon/lat. Returns a
+    Plotly Figure positioned over the data's bounding box on a MapLibre basemap.
+    """
+    import plotly.graph_objects as go  # lazy: keep module import lean
+
+    lon_f = np.asarray(lon, dtype=float).ravel()
+    lat_f = np.asarray(lat, dtype=float).ravel()
+    risk_f = np.asarray(risk, dtype=float).ravel()
+
+    fig = go.Figure()
+
+    # ISSR risk as a smooth density overlay. radius blurs the grid samples into
+    # a continuous field; only positive risk is drawn so clear sky stays clean.
+    fig.add_trace(
+        go.Densitymap(
+            lon=lon_f,
+            lat=lat_f,
+            z=risk_f,
+            radius=_MAP_DENSITY_RADIUS,
+            colorscale="Inferno",
+            opacity=0.55,
+            colorbar=dict(title="ISSR<br>risk", thickness=12, len=0.6, x=0.99),
+            name="ISSR risk",
+            hoverinfo="skip",
+        )
+    )
+
+    # Routes: muted gray for context/baseline, bright green for the chosen plan.
+    for r in routes:
+        fig.add_trace(
+            go.Scattermap(
+                lon=np.asarray(r.lon, dtype=float),
+                lat=np.asarray(r.lat, dtype=float),
+                mode="lines",
+                line=dict(
+                    width=3 if r.chosen else 1.5,
+                    color="#28dc5a" if r.chosen else "rgba(200,200,210,0.55)",
+                ),
+                name=f"{r.name} (chosen)" if r.chosen else r.name,
+                hovertemplate=f"{r.name}<extra></extra>",
+            )
+        )
+
+    center_lon = float(np.nanmean(lon_f)) if lon_f.size else 5.0
+    center_lat = float(np.nanmean(lat_f)) if lat_f.size else 46.5
+    fig.update_layout(
+        map=dict(style=_MAP_BASEMAP, center=dict(lon=center_lon, lat=center_lat), zoom=4.0),
+        margin=dict(l=0, r=0, t=34, b=0),
+        title=dict(text=f"ISSR risk + routes — source: {source} (slice FL{_MAP_SLICE_FL})", x=0.5),
+        paper_bgcolor="#0e0e10",
+        font=dict(color="#dddde2"),
+        legend=dict(bgcolor="rgba(20,20,24,0.6)", x=0.01, y=0.99),
+    )
+    return fig
 
 
 # =============================================================================
@@ -501,32 +609,36 @@ class MainWindow(QMainWindow):
         return wrap
 
     def _build_map_tab(self) -> QWidget:
-        # A real geographic panel: predicted ISSR risk over Europe with the
-        # solved routes drawn on top. setAspectLocked because it's a map.
-        self.map_plot = pg.PlotWidget(title="Map — geographic ISSR risk + routes")
-        self.map_plot.setLabel("bottom", "lon")
-        self.map_plot.setLabel("left", "lat")
-        self.map_plot.setAspectLocked(True)
-        self.map_plot.showGrid(x=True, y=True, alpha=0.2)
+        # A presentation-grade geographic panel: a real MapLibre basemap (drawn
+        # by Plotly) with the predicted ISSR risk as a density overlay and the
+        # solved routes on top, shown inside an embedded Chromium view. The view
+        # is backed by a temp HTML file that _render_map rewrites on each solve.
+        fd, self._map_html_path = tempfile.mkstemp(prefix="contrail_map_", suffix=".html")
+        os.close(fd)
 
-        self.map_heat = pg.ImageItem()
-        try:
-            self.map_heat.setColorMap(pg.colormap.get("inferno"))  # warm = higher risk
-        except Exception:
-            pass
-        self.map_plot.addItem(self.map_heat)
+        # QtWebEngine can't initialise under the offscreen Qt platform (no GPU /
+        # display) and would crash the process, so headless runs (CI, tests) get
+        # a placeholder while _render_map still writes the HTML. A real desktop
+        # session gets the live map.
+        headless = os.environ.get("QT_QPA_PLATFORM") == "offscreen"
+        if not _HAS_WEBENGINE or headless:
+            self.map_view = None
+            why = (
+                "headless session (offscreen) — open the GUI on a desktop to see the map"
+                if _HAS_WEBENGINE
+                else 'Map needs the web view: pip install -e ".[gui]" (plotly + PyQt6-WebEngine)'
+            )
+            msg = QLabel(why)
+            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            return msg
 
-        # Two route layers, drawn with NaN-separated polylines (connect="finite"):
-        # context routes (pre-solve / baseline) muted, chosen routes green.
-        self.map_routes_context = pg.PlotCurveItem(
-            pen=pg.mkPen((170, 170, 180, 130), width=1), connect="finite"
+        self.map_view = QWebEngineView()
+        self.map_view.setHtml(
+            "<body style='margin:0;background:#0e0e10;color:#888;"
+            "font-family:sans-serif'>"
+            "<p style='padding:1rem'>Build a scenario to render the map…</p></body>"
         )
-        self.map_routes_chosen = pg.PlotCurveItem(
-            pen=pg.mkPen((40, 220, 90), width=2), connect="finite"
-        )
-        self.map_plot.addItem(self.map_routes_context)
-        self.map_plot.addItem(self.map_routes_chosen)
-        return self.map_plot
+        return self.map_view
 
     def _active_anchor(self, field):
         """The GeoAnchor placing this ISSR field on the map.
@@ -542,43 +654,9 @@ class MainWindow(QMainWindow):
 
         return DEFAULT_CONFIG.anchor
 
-    def _render_map(self, chosen_by_flight: dict[str, int] | None) -> None:
-        """Draw the ISSR-risk heatmap + flight routes over real geography.
-
-        Works for BOTH the synthetic ISSRField and the MLIssrField, since they
-        share the rhi_excess_grid / mask_grid interface. On a 2-D map the
-        altitude dimension collapses, so each flight is one ground track; once
-        solved, chosen routes are drawn green over the muted context.
-        """
-        if self._world is None:
-            return
-        field = self._world.issr
-        anchor = self._active_anchor(field)
-        g = self._world.grid
-
-        # --- risk heatmap on a local (x_km, y_km) slice at a fixed altitude ---
-        nx, ny = 120, 80
-        xs = np.linspace(g.x_min_km, g.x_max_km, nx)
-        ys = np.linspace(g.y_min_km, g.y_max_km, ny)
-        xx, yy = np.meshgrid(xs, ys, indexing="ij")
-        zz = np.full_like(xx, fl_to_m(_MAP_SLICE_FL))
-        risk = np.asarray(field.rhi_excess_grid(xx, yy, zz), dtype=float)
-
-        # The local->geo transform is mildly nonlinear (lon depends on lat), so
-        # we place the image on its lon/lat bounding box — a small-angle
-        # approximation that matches the (exactly transformed) routes closely
-        # over this 1500x800 km box.
-        lons, lats = anchor.local_to_geo(xx, yy)
-        lon_min, lon_max = float(np.min(lons)), float(np.max(lons))
-        lat_min, lat_max = float(np.min(lats)), float(np.max(lats))
-        self.map_heat.setImage(risk, autoLevels=True)
-        self.map_heat.setRect(QRectF(lon_min, lat_min, lon_max - lon_min, lat_max - lat_min))
-
-        # --- routes: one ground track per flight (chosen profile or baseline) ---
-        ctx_lon: list[np.ndarray] = []
-        ctx_lat: list[np.ndarray] = []
-        cho_lon: list[np.ndarray] = []
-        cho_lat: list[np.ndarray] = []
+    def _map_routes(self, chosen_by_flight: dict[str, int] | None, anchor) -> list[RouteLine]:
+        """Per-flight ground tracks in lon/lat (chosen profile, else baseline)."""
+        routes: list[RouteLine] = []
         for flight in self._flights:
             profile = flight.baseline
             is_chosen = False
@@ -592,27 +670,55 @@ class MainWindow(QMainWindow):
             wx = np.array([w[0] for w in wps], dtype=float)
             wy = np.array([w[1] for w in wps], dtype=float)
             lon, lat = anchor.local_to_geo(wx, wy)
-            # NaN terminator so consecutive flights aren't joined by the curve.
-            lon = np.append(np.asarray(lon, dtype=float), np.nan)
-            lat = np.append(np.asarray(lat, dtype=float), np.nan)
-            if is_chosen:
-                cho_lon.append(lon)
-                cho_lat.append(lat)
-            else:
-                ctx_lon.append(lon)
-                ctx_lat.append(lat)
+            routes.append(
+                RouteLine(
+                    name=flight.name,
+                    lon=np.asarray(lon, dtype=float),
+                    lat=np.asarray(lat, dtype=float),
+                    chosen=is_chosen,
+                )
+            )
+        return routes
 
-        self.map_routes_context.setData(
-            np.concatenate(ctx_lon) if ctx_lon else [],
-            np.concatenate(ctx_lat) if ctx_lat else [],
-        )
-        self.map_routes_chosen.setData(
-            np.concatenate(cho_lon) if cho_lon else [],
-            np.concatenate(cho_lat) if cho_lat else [],
-        )
+    def _render_map(self, chosen_by_flight: dict[str, int] | None) -> None:
+        """Render the ISSR-risk overlay + flight routes onto the geographic map.
 
+        Works for BOTH the synthetic ISSRField and the MLIssrField, since they
+        share the rhi_excess_grid interface. On a 2-D map the altitude dimension
+        collapses, so each flight is one ground track; once solved, chosen routes
+        are drawn green over the muted context. Builds a Plotly figure and loads
+        its self-contained HTML into the embedded web view.
+        """
+        if self._world is None:
+            return
+        field = self._world.issr
+        anchor = self._active_anchor(field)
+        g = self._world.grid
+
+        # Sample the risk field on a local (x_km, y_km) slice at a fixed altitude,
+        # then map every sample point to lon/lat (exact transform, not a bbox).
+        xs = np.linspace(g.x_min_km, g.x_max_km, _MAP_GRID_NX)
+        ys = np.linspace(g.y_min_km, g.y_max_km, _MAP_GRID_NY)
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+        zz = np.full_like(xx, fl_to_m(_MAP_SLICE_FL))
+        risk = np.asarray(field.rhi_excess_grid(xx, yy, zz), dtype=float)
+        lons, lats = anchor.local_to_geo(xx, yy)
+
+        routes = self._map_routes(chosen_by_flight, anchor)
         source = getattr(field, "source", "synthetic")
-        self.map_plot.setTitle(f"Map — ISSR: {source}  (risk slice at FL{_MAP_SLICE_FL})")
+        fig = build_map_figure(source=source, lon=lons, lat=lats, risk=risk, routes=routes)
+
+        # Write a self-contained page (plotly.js inlined) and load it from disk —
+        # setHtml caps payloads at ~2 MB, which the inlined library exceeds. A
+        # cache-busting query forces the view to re-read after each solve.
+        html = fig.to_html(include_plotlyjs="inline", full_html=True,
+                           config={"displayModeBar": True})
+        with open(self._map_html_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        if self.map_view is not None:
+            url = QUrl.fromLocalFile(self._map_html_path)
+            url.setQuery(f"v={time.time()}")
+            self.map_view.load(url)
 
     # ---------------------------------------------------------------- config --
     def _build_cfg(self, topic: str = "") -> solver_pb2.ScenarioConfig:

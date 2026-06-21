@@ -30,6 +30,11 @@ gui = [
     "PyQt6>=6.6",
     "pyqtgraph>=0.13",
     "PyOpenGL>=3.1",
+    # Geographic Map tab: Plotly draws a MapLibre basemap (real coastlines /
+    # borders / labels, no API token) with the ISSR density overlay + routes,
+    # shown inside an embedded Chromium view (PyQt6-WebEngine).
+    "plotly>=5.24",
+    "PyQt6-WebEngine>=6.6",
 ]
 dev = [
     "pytest>=8.0",

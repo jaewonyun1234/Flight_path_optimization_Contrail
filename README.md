@@ -80,10 +80,12 @@ docker run --rm -p 50051:50051 -p 5556:5556 contrail-solver
 CI builds the image, smoke-tests that the server boots, and publishes it to
 ghcr.io on every push to main.
 
-The dashboard has five panels: live CP-SAT convergence (over ZMQ), the conflict-graph
+The dashboard has six tabs: live CP-SAT convergence (over ZMQ), the conflict-graph
 topology, QUBO matrix statistics (size, sparsity, penalty constants), the
-chosen-option trade-offs, and the quantum benchmark (CP-SAT vs Pasqal vs Xanadu over
-N seeds, with live convergence curves for the BO loop and the GBS sampler).
+chosen-option trade-offs, the quantum benchmark (CP-SAT vs Pasqal vs Xanadu over
+N seeds, with live convergence curves for the BO loop and the GBS sampler), and a
+geographic map — the predicted ISSR risk as a density overlay on a real
+Plotly/MapLibre basemap with the chosen vs context routes drawn on top.
 
 The benchmark also runs headless:
 
