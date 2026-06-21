@@ -32,6 +32,36 @@ jobs:
       - name: Pytest
         run: pytest -q
 
+  ml:
+    # The contrail_ml ISSR model + MLOps lifecycle. Runs the HERMETIC ML tests
+    # (synthetic fallback only — no network, no credentials). Separate job so a
+    # heavy [ml] install never slows the core lint-type-test gate, and the ML
+    # deps never touch the runtime Docker image.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package with ML + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[ml,dev]"
+
+      - name: Generate gRPC stubs
+        run: bash scripts/gen_proto.sh
+
+      - name: Ruff (lint contrail_ml)
+        run: ruff check contrail_ml
+
+      - name: Mypy (type-check contrail_ml)
+        run: mypy contrail_ml
+
+      - name: Pytest (hermetic ML tests)
+        run: pytest tests/test_ml_*.py -q
+
   docker-build:
     runs-on: ubuntu-latest
     steps:
@@ -58,8 +88,8 @@ jobs:
   docker-publish:
     runs-on: ubuntu-latest
     # Only publish on pushes to main — not on pull requests.
-    # Both the test suite AND the smoke-test must pass first.
-    needs: [lint-type-test, docker-build]
+    # The full suite (core + ML) AND the image smoke-test must pass first.
+    needs: [lint-type-test, ml, docker-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read

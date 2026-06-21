@@ -36,6 +36,30 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.4",
 ]
+# Observation-grounded ISSR model + full MLOps lifecycle. Install with:
+#   pip install -e ".[ml]"
+# Deliberately NOT in the core deps: the deployed solver image (Dockerfile
+# runtime stage) must stay lean and free of the heavy scientific/geo stack.
+# The geo loaders (pycontrails/xarray/cfgrib/zarr/gcsfs/netCDF4/dask) are only
+# needed to BUILD a dataset from real weather; training/serving/tests on a
+# prepared parquet need only the tabular stack (pandas/scipy/sklearn/xgboost).
+ml = [
+    "pycontrails>=0.60",
+    "xarray>=2024.0",
+    "netCDF4",
+    "cfgrib",            # GFS is GRIB
+    "zarr",
+    "gcsfs",             # ARCO-ERA5 is zarr on a public GCS bucket
+    "dask",
+    "pandas>=2.0",
+    "pyarrow",
+    "scipy",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "mlflow>=2.12",
+    "matplotlib",        # reliability / diagnostic plots logged to MLflow
+    "tabulate",          # markdown rendering of the comparison table for MLflow
+]
 # Real quantum SDK backends. The pipelines run WITHOUT these (built-in
 # statevector / exact-hafnian samplers); installing them switches
 # pasqal_analog to Pulser's QuTiP emulator and xanadu_gbs to Strawberry
@@ -56,7 +80,12 @@ Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail
 # the `service` directory so the generated subpackage imports fine once built.
 # ---------------------------------------------------------------------------
 [tool.setuptools]
-packages = ["contrail_env", "service"]
+packages = [
+    "contrail_env",
+    "service",
+    "contrail_ml",
+    "contrail_ml.data",
+]
 
 # ---------------------------------------------------------------------------
 # Ruff — lint the code we add in this layer. The nine pre-existing
