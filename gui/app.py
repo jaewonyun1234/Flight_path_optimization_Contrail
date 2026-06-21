@@ -47,6 +47,15 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+# MapLibre GL (Plotly's map backend) requires WebGL. QtWebEngine's embedded
+# Chromium often has GPU acceleration blocked by default on Windows — force
+# SwiftShader (Chromium's built-in software WebGL renderer) so the map always
+# works regardless of GPU driver / blacklist. Must be set before any Qt import.
+os.environ.setdefault(
+    "QTWEBENGINE_CHROMIUM_FLAGS",
+    "--enable-webgl --use-gl=swiftshader --ignore-gpu-blocklist",
+)
+
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
