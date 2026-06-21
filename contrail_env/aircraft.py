@@ -104,9 +104,9 @@ class LinearJetPerformance:
           so extra fuel ~ m * g * dh / specific_energy_release / engine_eff.
     """
     # Reference state for the linear expansion
-    mass_ref_kg:    float = 70_000.0
-    fl_ref:         int   = 360
-    mach_ref:       float = 0.78
+    mass_ref_kg:    float = 70_000.0  # typical mid-cruise weight (not full of fuel)
+    fl_ref:         int   = 360 # reference cruise altitude. Not specifically tied to full fuel weight
+    mach_ref:       float = 0.78 # typical A320 cruise speed
 
     # Reference cruise burn (kg/s) at the ref state
     burn_ref_kgs:   float = 0.67

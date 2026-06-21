@@ -328,8 +328,8 @@ def voxelize_trajectory(
     waypoints: Sequence[tuple[float, float, float, float]],
 ) -> list[tuple[int, int, int, int]]:
     """
-    Convert a continuous trajectory (a list of physical waypoints)
-    into the sequence of 4D cells it occupies.
+    Convert a discrete trajectory (a list of physical waypoints)
+    into the sequence of 4D cells (indices of ix, iy, iz, it) it occupies.
 
     Each waypoint is (x_km, y_km, z_m, t_s). The output is a list of
     (ix, iy, iz, it) tuples in trajectory order, with CONSECUTIVE
