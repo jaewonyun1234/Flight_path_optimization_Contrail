@@ -53,7 +53,7 @@ from dataclasses import dataclass
 # works regardless of GPU driver / blacklist. Must be set before any Qt import.
 os.environ.setdefault(
     "QTWEBENGINE_CHROMIUM_FLAGS",
-    "--enable-webgl --disable-gpu --disable-gpu-sandbox",
+    "--disable-gpu --enable-unsafe-swiftshader --ignore-gpu-blocklist",
 )
 
 import numpy as np
