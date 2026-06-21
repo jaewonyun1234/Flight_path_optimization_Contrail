@@ -66,10 +66,14 @@ def build_world_and_flights(cfg: solver_pb2.ScenarioConfig) -> tuple[World, list
         if cfg.issr_threshold > 0:
             world.issr.threshold = float(cfg.issr_threshold)
     elif source == "ml":
-        # Trained-model ISSR field. contrail_ml is imported lazily (and only
-        # here), so the core server image without the [ml] extra is unaffected
-        # unless a client explicitly asks for issr_source="ml".
-        from contrail_ml.config import MLConfig
+        try:
+            from contrail_ml.config import MLConfig
+        except ImportError as exc:
+            raise ValueError(
+                "issr_source='ml' is not available in this deployment — "
+                "the server image ships only the CP-SAT solver. "
+                "Install contrail_ml locally with: pip install -e '.[ml]'"
+            ) from exc
 
         ml_cfg = MLConfig()
         if cfg.issr_p_threshold > 0:

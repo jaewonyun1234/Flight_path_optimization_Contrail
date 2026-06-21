@@ -133,9 +133,12 @@ class SolverServicer(solver_pb2_grpc.SolverServicer):
 
         # CP-SAT is blocking; run it off the event loop.
         loop = asyncio.get_running_loop()
-        result, n_conflicts, evals = await loop.run_in_executor(
-            None, lambda: solve_scenario(request, on_progress)
-        )
+        try:
+            result, n_conflicts, evals = await loop.run_in_executor(
+                None, lambda: solve_scenario(request, on_progress)
+            )
+        except ValueError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
         return make_response(result, n_conflicts, evals)
 
 
