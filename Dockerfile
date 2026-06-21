@@ -32,6 +32,11 @@ COPY pyproject.toml README.md ./
 COPY contrail_env/ ./contrail_env/
 COPY service/ ./service/
 COPY scripts/ ./scripts/
+# contrail_ml is a declared package, so its source must be present for the
+# build — but only the SOURCE. `pip install .` installs the core deps, NOT the
+# heavy `[ml]` extra, so the runtime image stays lean. The ML ISSR path imports
+# contrail_ml lazily and only works when the [ml] extra is also installed.
+COPY contrail_ml/ ./contrail_ml/
 RUN pip install .
 
 # The gRPC stubs are gitignored — generate them from solver.proto at build time.

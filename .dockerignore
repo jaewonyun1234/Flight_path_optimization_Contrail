@@ -28,6 +28,13 @@ venv/
 .venv/
 .env
 
+# contrail_ml artifacts — the server image never needs MLflow runs, versioned
+# datasets, or trained model files (and the [ml] extra isn't installed anyway).
+mlruns/
+data/processed/
+*.joblib
+*.npz
+
 # Editor / OS noise and local notes
 .DS_Store
 *.ipynb_checkpoints/

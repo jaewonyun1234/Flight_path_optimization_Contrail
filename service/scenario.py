@@ -58,11 +58,33 @@ def build_world_and_flights(cfg: solver_pb2.ScenarioConfig) -> tuple[World, list
         come from any direction yet still overlap and conflict, and
       * its own baseline cruise flight level.
     """
-    world = default_european_world(seed=cfg.seed, n_issr_blobs=cfg.n_issr_blobs)
-    # Threshold drives what counts as a contrail (cell RHi-excess > threshold),
-    # so it affects the solve, not just the picture. 0 means "use the default".
-    if cfg.issr_threshold > 0:
-        world.issr.threshold = float(cfg.issr_threshold)
+    source = cfg.issr_source or "synthetic"
+    if source == "synthetic":
+        world = default_european_world(seed=cfg.seed, n_issr_blobs=cfg.n_issr_blobs)
+        # Threshold drives what counts as a contrail (cell RHi-excess > threshold),
+        # so it affects the solve, not just the picture. 0 means "use the default".
+        if cfg.issr_threshold > 0:
+            world.issr.threshold = float(cfg.issr_threshold)
+    elif source == "ml":
+        # Trained-model ISSR field. contrail_ml is imported lazily (and only
+        # here), so the core server image without the [ml] extra is unaffected
+        # unless a client explicitly asks for issr_source="ml".
+        from contrail_ml.config import MLConfig
+
+        ml_cfg = MLConfig()
+        if cfg.issr_p_threshold > 0:
+            ml_cfg = ml_cfg.with_overrides(issr_p_threshold=cfg.issr_p_threshold)
+        world = default_european_world(
+            seed=cfg.seed,
+            issr_source="ml",
+            issr_kwargs=dict(
+                config=ml_cfg,
+                met_source="gfs",          # operational forecast
+                time=cfg.issr_time or None,
+            ),
+        )
+    else:
+        raise ValueError(f"unknown issr_source {source!r} (use 'synthetic' or 'ml')")
     flights = build_random_flights(
         n_flights=cfg.n_flights,
         world=world,

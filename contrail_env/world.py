@@ -163,6 +163,8 @@ def default_european_world(
     n_issr_blobs: int = 6,
     nx: int = 60,
     ny: int = 32,
+    issr_source: str = "synthetic",
+    issr_kwargs: dict | None = None,
 ) -> World:
     """
     Construct a default World matching the canonical example geometry:
@@ -174,6 +176,16 @@ def default_european_world(
           bucket and the time dimension stops doing useful work)
         - 6 random ISSR blobs
         - Uniform 3x3 sector grid with capacity 3
+
+    issr_source:
+        "synthetic" (default) — the random Gaussian-blob ISSR field, exactly
+            as before, so all existing callers/tests are unaffected.
+        "ml" — a trained model's predicted field (contrail_ml.MLIssrField),
+            which honours the SAME ISSRField interface, so World/qubo need no
+            changes. contrail_ml is imported LAZILY here, so the core install
+            (no [ml] extra) still imports contrail_env fine as long as the ml
+            source is not requested.
+        `issr_kwargs` is forwarded to the chosen ISSR-field factory.
     """
     from .synthetic_issr import random_issr_field
 
@@ -185,11 +197,23 @@ def default_european_world(
         dt_s=600.0, nt=12,
     )
 
-    issr = random_issr_field(
-        n_blobs=n_issr_blobs,
-        domain=(0.0, 1500.0, 0.0, 800.0, 9000.0, 12500.0),
-        seed=seed,
-    )
+    kw = dict(issr_kwargs or {})
+    if issr_source == "synthetic":
+        issr = random_issr_field(
+            n_blobs=n_issr_blobs,
+            domain=(0.0, 1500.0, 0.0, 800.0, 9000.0, 12500.0),
+            seed=seed,
+            **kw,
+        )
+    elif issr_source == "ml":
+        # Lazy import: only the "ml" branch pulls in the [ml] extra.
+        from contrail_ml.issr_field import ml_issr_field
+
+        issr = ml_issr_field(**kw)
+    else:
+        raise ValueError(
+            f"unknown issr_source {issr_source!r} (use 'synthetic' or 'ml')"
+        )
 
     from .airspace import uniform_sector_grid
     sectors = uniform_sector_grid(
