@@ -8,6 +8,12 @@ import warnings
 import numpy as np
 import pytest
 
+# Needs the [ml] extra (pandas/scikit-learn/xgboost). The core lint-type-test CI
+# job installs only [dev], so skip there; the dedicated `ml` job runs these fully.
+pytest.importorskip("pandas")
+pytest.importorskip("sklearn")
+pytest.importorskip("xgboost")
+
 from contrail_ml.data.schema import LABEL_DELTA
 from contrail_ml.data.synthetic_fallback import make_synthetic_training_table
 from contrail_ml.model import RHiCorrector

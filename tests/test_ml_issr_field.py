@@ -1,6 +1,11 @@
 """MLIssrField conforms to the ISSRField interface, with correct geo mapping."""
 
 import numpy as np
+import pytest
+
+# Needs the [ml] extra (scipy interpolation). The core lint-type-test CI job
+# installs only [dev], so skip there; the dedicated `ml` job runs these fully.
+pytest.importorskip("scipy")
 
 from contrail_env import fl_to_m
 from contrail_ml.features import GeoAnchor, altitude_to_pressure_hpa

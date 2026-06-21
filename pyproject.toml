@@ -113,6 +113,12 @@ extend-exclude = [
 select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]
 
+# The ML test modules call pytest.importorskip(...) before importing contrail_ml
+# so the core lint-type-test job (no [ml] extra) skips them instead of erroring.
+# That guard must run before the imports it protects, which is exactly E402.
+[tool.ruff.lint.per-file-ignores]
+"tests/test_ml_*.py" = ["E402"]
+
 # ---------------------------------------------------------------------------
 # Mypy — fully type-check the new code. The pre-existing modules cannot be
 # edited, so their (best-effort) type errors are not enforced; the new

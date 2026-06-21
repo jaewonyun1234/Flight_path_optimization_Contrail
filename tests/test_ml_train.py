@@ -6,6 +6,14 @@ comparison — the core of the MLOps story — without a tracking server.
 
 import warnings
 
+import pytest
+
+# Needs the [ml] extra (pandas/scikit-learn/xgboost). The core lint-type-test CI
+# job installs only [dev], so skip there; the dedicated `ml` job runs these fully.
+pytest.importorskip("pandas")
+pytest.importorskip("sklearn")
+pytest.importorskip("xgboost")
+
 from contrail_ml.config import MLConfig
 from contrail_ml.data.synthetic_fallback import make_synthetic_training_table
 from contrail_ml.train import run_training
