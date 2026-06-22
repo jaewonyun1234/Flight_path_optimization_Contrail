@@ -44,7 +44,6 @@ data/processed/
 # Editor / OS noise and local notes
 .DS_Store
 *.ipynb_checkpoints/
-CLAUDE.md
 results.csv
 
 # Docker files themselves don't need to be in the context

@@ -7,7 +7,6 @@ build/
 .env
 .DS_Store
 *.ipynb_checkpoints/
-CLAUDE.md
 
 # Environments & caches
 .venv/
