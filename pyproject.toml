@@ -120,6 +120,7 @@ extend-exclude = [
     "contrail_env/flight.py",
     "contrail_env/options.py",
     "contrail_env/qubo.py",
+    "playground",
 ]
 
 [tool.ruff.lint]
