@@ -16,17 +16,14 @@ message ScenarioConfig {
   double time_limit_s = 9;        // CP-SAT time limit
   string progress_topic = 10;     // ZMQ topic to publish progress on
   double issr_threshold = 11;     // RHi-excess above which a cell forms a contrail
-  // ML ISSR source (plan §7). Default "" == "synthetic", so existing clients
-  // are unaffected. "ml" builds the world's ISSR from a trained model.
-  string issr_source = 12;        // "synthetic" (default) or "ml"
-  string issr_time = 13;          // ISO valid-time for the ML forecast (optional)
-  double issr_p_threshold = 14;   // calibrated P(ISSR) cut for is_inside (0 -> default)
-  // Real historical-traffic source (contrail_flights / OpenSky). Default
-  // "" == "synthetic", so existing clients are unaffected. "real" pulls actual
-  // flown ADS-B tracks for the window below and reduces them to flights.
-  string flight_source = 15;      // "synthetic" (default) or "real"
-  string flight_start_time = 16;  // ISO start of the historical pull window
-  string flight_end_time = 17;    // ISO end of the historical pull window
+  // ISSR source. Only "synthetic" (default; "" == "synthetic") is supported.
+  string issr_source = 12;        // "synthetic" (default)
+  string issr_time = 13;          // reserved (unused)
+  double issr_p_threshold = 14;   // reserved (unused)
+  // Flight source. Only "synthetic" (default; "" == "synthetic") is supported.
+  string flight_source = 15;      // "synthetic" (default)
+  string flight_start_time = 16;  // reserved (unused)
+  string flight_end_time = 17;    // reserved (unused)
 }
 
 message FlightChoice {

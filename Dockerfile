@@ -32,12 +32,10 @@ COPY pyproject.toml README.md ./
 COPY contrail_env/ ./contrail_env/
 COPY service/ ./service/
 COPY scripts/ ./scripts/
-# contrail_ml and the quantum solvers (pasqal_analog, xanadu_gbs) are
-# intentionally excluded. This image has one job: run the CP-SAT gRPC server.
-# ML training/inference and quantum sampling are separate concerns that carry
-# heavy deps (scipy/sklearn/xgboost/pulser/strawberryfields) and run in their
-# own environments. Including their source here would ship dead code that can
-# never execute (deps absent) and would crash at request time if called.
+# Only contrail_env + service ship here — the image's one job is the CP-SAT gRPC
+# server. The quantum solver modules (pasqal_analog, xanadu_gbs) ride along in
+# contrail_env and run on their built-in fallbacks; the optional [quantum] SDKs
+# (pulser/strawberryfields) are not installed, keeping the runtime image lean.
 RUN pip install .
 
 # The gRPC stubs are gitignored — generate them from solver.proto at build time.

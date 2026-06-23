@@ -59,46 +59,18 @@ def build_world_and_flights(cfg: solver_pb2.ScenarioConfig) -> tuple[World, list
       * its own baseline cruise flight level.
     """
     source = cfg.issr_source or "synthetic"
-    if source == "synthetic":
-        world = default_european_world(seed=cfg.seed, n_issr_blobs=cfg.n_issr_blobs)
-        # Threshold drives what counts as a contrail (cell RHi-excess > threshold),
-        # so it affects the solve, not just the picture. 0 means "use the default".
-        if cfg.issr_threshold > 0:
-            world.issr.threshold = float(cfg.issr_threshold)
-    elif source == "ml":
-        try:
-            from contrail_ml.config import MLConfig
-        except ImportError as exc:
-            raise ValueError(
-                "issr_source='ml' is not available in this deployment — "
-                "the server image ships only the CP-SAT solver. "
-                "Install contrail_ml locally with: pip install -e '.[ml]'"
-            ) from exc
+    if source != "synthetic":
+        raise ValueError(f"unknown issr_source {source!r} (use 'synthetic')")
+    world = default_european_world(seed=cfg.seed, n_issr_blobs=cfg.n_issr_blobs)
+    # Threshold drives what counts as a contrail (cell RHi-excess > threshold),
+    # so it affects the solve, not just the picture. 0 means "use the default".
+    if cfg.issr_threshold > 0:
+        world.issr.threshold = float(cfg.issr_threshold)
 
-        ml_cfg = MLConfig()
-        if cfg.issr_p_threshold > 0:
-            ml_cfg = ml_cfg.with_overrides(issr_p_threshold=cfg.issr_p_threshold)
-        world = default_european_world(
-            seed=cfg.seed,
-            issr_source="ml",
-            issr_kwargs=dict(
-                config=ml_cfg,
-                met_source="gfs",          # operational forecast
-                time=cfg.issr_time or None,
-            ),
-        )
-    else:
-        raise ValueError(f"unknown issr_source {source!r} (use 'synthetic' or 'ml')")
-
-    # Flight source: synthetic random generator (default) or real historical
-    # OpenSky traffic. The real path keeps its own origin/destination/baseline,
-    # so it returns before the synthetic chord-geometry randomization below.
     flight_source = cfg.flight_source or "synthetic"
-    if flight_source == "real":
-        return world, _build_real_flights(cfg, world)
     if flight_source != "synthetic":
         raise ValueError(
-            f"unknown flight_source {flight_source!r} (use 'synthetic' or 'real')"
+            f"unknown flight_source {flight_source!r} (use 'synthetic')"
         )
 
     flights = build_random_flights(
@@ -147,49 +119,6 @@ def build_world_and_flights(cfg: solver_pb2.ScenarioConfig) -> tuple[World, list
             initial_fl=fl,
         )
     return world, flights
-
-
-def _build_real_flights(cfg: solver_pb2.ScenarioConfig, world: World) -> list[Flight]:
-    """Build real historical flights via contrail_flights (OpenSky).
-
-    contrail_flights is imported lazily (and only here), so the core server
-    image without the [flights] extra is unaffected unless a client explicitly
-    asks for flight_source="real". Missing deps / credentials / network surface
-    as a clear ValueError (mapped to a gRPC error by the Solve handler), never a
-    silent crash or fabricated traffic.
-    """
-    try:
-        from contrail_flights.build_dataset import flights_for
-        from contrail_flights.config import FlightsConfig
-        from contrail_flights.opensky_client import OpenSkyUnavailableError
-    except ImportError as exc:
-        raise ValueError(
-            "flight_source='real' is not available in this deployment — the "
-            "server image ships only the synthetic flight generator. Install "
-            "contrail_flights locally with: pip install -e '.[flights]'"
-        ) from exc
-
-    # Derive the geo planning box from the world grid via the shared anchor, so
-    # the real flights land in the same local frame the optimizer/grid use.
-    fcfg = FlightsConfig()
-    g = world.grid
-    lon0, lat0 = fcfg.anchor.local_to_geo(g.x_min_km, g.y_min_km)
-    lon1, lat1 = fcfg.anchor.local_to_geo(g.x_max_km, g.y_max_km)
-    overrides: dict[str, object] = dict(
-        lon_min=min(lon0, lon1), lon_max=max(lon0, lon1),
-        lat_min=min(lat0, lat1), lat_max=max(lat0, lat1),
-        snapshot_window_s=cfg.snapshot_window_s or 300.0,
-    )
-    if cfg.flight_start_time:
-        overrides["start_time"] = cfg.flight_start_time
-    if cfg.flight_end_time:
-        overrides["end_time"] = cfg.flight_end_time
-    fcfg = fcfg.with_overrides(**overrides)
-
-    try:
-        return flights_for(fcfg, max_flights=cfg.n_flights or None)
-    except OpenSkyUnavailableError as exc:
-        raise ValueError(str(exc)) from exc
 
 
 def build_scenario_full(
