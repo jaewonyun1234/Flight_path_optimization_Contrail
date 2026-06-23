@@ -24,6 +24,3 @@ data/processed/
 *.npz
 *.dvc
 .dvc/
-
-# Local scratch space — not part of the project
-playground/
