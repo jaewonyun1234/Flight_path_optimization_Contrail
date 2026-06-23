@@ -101,7 +101,7 @@ class _ProgressCallback(cp_model.CpSolverSolutionCallback):
     CP-SAT calls `on_solution_callback` every time it finds a new, strictly
     better feasible solution. We use that to (a) count improvements and
     (b) stream the convergence curve to whoever passed `on_progress`
-    (the gRPC server wires this to ZMQ).
+    (the dashboard wires this to its live convergence curve).
     """
 
     def __init__(self, on_progress: Callable[[int, float], None] | None) -> None:

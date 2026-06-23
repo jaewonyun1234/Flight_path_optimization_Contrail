@@ -9,19 +9,19 @@ ISSR risk over Europe with the solved routes drawn on a real (offline) basemap.
 
 DATA FLOW
 =========
-* The CP-SAT solve runs on the gRPC server; the GUI reaches it through
-  SolveWorker (a QThread) and streams progress over ZMQ — the UI never blocks.
-* The server returns only the solution, so the dashboard rebuilds the QUBO and
-  conflict graph LOCALLY from the same (seeded) ScenarioConfig via
-  service.scenario.build_scenario_full + contrail_env.assemble_qubo. Because the
-  scenario is fully seeded, the reconstruction matches what the server solved.
-* The quantum benchmark (tab 5) runs IN-PROCESS in a worker thread: the
-  quantum samplers live in contrail_env (pasqal_analog, xanadu_gbs) and the
-  protocol in contrail_env.benchmark — no service round-trip needed.
+* Everything runs IN-PROCESS — no server, no broker. The CP-SAT solve runs off
+  the UI thread in SolveWorker (a QThread); its progress callback fires the Qt
+  `progress` signal so the convergence curve updates live without blocking.
+* The dashboard builds the QUBO and conflict graph from the same (seeded)
+  ScenarioConfig via contrail_env.scenario.build_scenario_full +
+  contrail_env.assemble_qubo, so every panel shows exactly what was solved.
+* The quantum benchmark (tab 5) likewise runs in a worker thread: the samplers
+  live in contrail_env (pasqal_analog, xanadu_gbs) and the protocol in
+  contrail_env.benchmark.
 
 PANELS
 ======
-1. Live CP-SAT convergence  — objective vs improvement index (ZMQ stream).
+1. Live CP-SAT convergence  — objective vs improvement index (live, in-process).
 2. Conflict-graph topology   — option nodes grouped by flight, conflict edges.
 3. QUBO & matrix analytics   — size, sparsity, penalty constants, energy offset,
                                and a heatmap of |Q|.
@@ -44,10 +44,9 @@ import os
 import random
 import sys
 import tempfile
-import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -88,16 +87,11 @@ from contrail_env import assemble_qubo, fl_to_m, waypoints_for
 from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
 from contrail_env.geo import EUROPEAN_ANCHOR
 from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
-from service.client import DEFAULT_SERVER_ADDRESS, SolverClient
-from service.generated import solver_pb2
-from service.progress import DEFAULT_SUB_ADDRESS, subscribe
-from service.scenario import build_scenario_full
+from contrail_env.scenario import ScenarioConfig, build_scenario_full, solve_scenario
 
 # Fixed scenario knobs not exposed as controls (sensible defaults per the brief).
 CORRIDOR_FRAC = 0.05
 SNAPSHOT_WINDOW_S = 300.0
-# Head start (seconds) for the SUB socket to connect before the solve emits.
-_SUB_HEAD_START_S = 0.25
 # Altitude (FL) of the horizontal slice the map heatmap shows. A 2-D map can
 # only show one altitude of the 3-D risk field; FL360 is the middle of the band.
 _MAP_SLICE_FL = 360
@@ -404,53 +398,34 @@ def build_map_figure(
 # =============================================================================
 
 class SolveWorker(QThread):
-    """Runs one solve off the UI thread, streaming progress via signals."""
+    """Runs one CP-SAT solve off the UI thread, streaming progress via signals.
+
+    The solve runs in-process (contrail_env.scenario.solve_scenario); the
+    progress callback fires on this worker thread and the Qt signal hands each
+    incumbent to the UI thread, so the dashboard stays responsive with no
+    network service involved.
+    """
 
     progress = pyqtSignal(int, float)
-    finished_ok = pyqtSignal(object)   # solver_pb2.SolveResponse
+    finished_ok = pyqtSignal(object)   # contrail_env.scenario.SolveResult
     failed = pyqtSignal(str)
 
-    def __init__(
-        self,
-        cfg: solver_pb2.ScenarioConfig,
-        server_address: str = DEFAULT_SERVER_ADDRESS,
-        sub_address: str = DEFAULT_SUB_ADDRESS,
-    ) -> None:
+    def __init__(self, cfg: ScenarioConfig) -> None:
         super().__init__()
         self._cfg = cfg
-        self._server_address = server_address
-        self._sub_address = sub_address
 
     def run(self) -> None:
-        box: dict[str, object] = {}
-
-        def do_solve() -> None:
-            # Brief delay so the subscriber below connects first (slow joiner).
-            time.sleep(_SUB_HEAD_START_S)
-            try:
-                with SolverClient(self._server_address) as client:
-                    box["resp"] = client.solve(self._cfg)
-            except Exception as exc:
-                box["err"] = exc
-
-        solve_thread = threading.Thread(target=do_solve, daemon=True)
-        solve_thread.start()
-
         try:
-            for improvement, objective in subscribe(
-                self._cfg.progress_topic,
-                self._sub_address,
-                stop=lambda: not solve_thread.is_alive(),
-            ):
-                self.progress.emit(improvement, objective)
+            result = solve_scenario(
+                self._cfg,
+                on_progress=lambda improvement, objective: self.progress.emit(
+                    improvement, objective
+                ),
+            )
         except Exception as exc:
-            box.setdefault("err", exc)
-
-        solve_thread.join()
-        if "err" in box:
-            self.failed.emit(str(box["err"]))
+            self.failed.emit(str(exc))
         else:
-            self.finished_ok.emit(box["resp"])
+            self.finished_ok.emit(result)
 
 
 # =============================================================================
@@ -461,7 +436,7 @@ class BenchmarkWorker(QThread):
     """One full benchmark sweep: CP-SAT vs Pasqal vs Xanadu over N seeds.
 
     The scenario factory reuses the SAME seeded construction as the rest of
-    the dashboard (service.scenario.build_scenario_full), so the instances
+    the dashboard (contrail_env.scenario.build_scenario_full), so the instances
     benchmarked here are exactly the ones the other tabs display.
     """
 
@@ -473,7 +448,7 @@ class BenchmarkWorker(QThread):
 
     def __init__(
         self,
-        cfg: solver_pb2.ScenarioConfig,
+        cfg: ScenarioConfig,
         seeds: list[int],
         n_shots: int,
         bo_iters: int,
@@ -486,9 +461,7 @@ class BenchmarkWorker(QThread):
 
     def run(self) -> None:
         def factory(seed: int):
-            cfg = solver_pb2.ScenarioConfig()
-            cfg.CopyFrom(self._cfg)
-            cfg.seed = seed
+            cfg = replace(self._cfg, seed=seed)
             _world, _flights, evals, conflicts, buckets = build_scenario_full(cfg)
             return evals, conflicts, buckets
 
@@ -519,7 +492,7 @@ class MainWindow(QMainWindow):
 
         self._worker: SolveWorker | None = None
         self._bench_worker: BenchmarkWorker | None = None
-        self._pending_cfg: solver_pb2.ScenarioConfig | None = None
+        self._pending_cfg: ScenarioConfig | None = None
 
         # Benchmark progress state (see _on_bench_phase / _refresh_bench_status).
         self._bench_t0 = 0.0
@@ -621,7 +594,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def _build_convergence_tab(self) -> QWidget:
-        self.conv_plot = pg.PlotWidget(title="CP-SAT incumbent objective (live, via ZMQ)")
+        self.conv_plot = pg.PlotWidget(title="CP-SAT incumbent objective (live)")
         self.conv_plot.setLabel("bottom", "improvement index")
         self.conv_plot.setLabel("left", "objective (combined cost)")
         self.conv_plot.showGrid(x=True, y=True, alpha=0.3)
@@ -921,8 +894,8 @@ class MainWindow(QMainWindow):
             self.map_view.load(url)
 
     # ---------------------------------------------------------------- config --
-    def _build_cfg(self, topic: str = "") -> solver_pb2.ScenarioConfig:
-        return solver_pb2.ScenarioConfig(
+    def _build_cfg(self) -> ScenarioConfig:
+        return ScenarioConfig(
             seed=self.seed_spin.value(),
             n_flights=self.flights_spin.value(),
             n_issr_blobs=self.blobs_spin.value(),
@@ -933,11 +906,10 @@ class MainWindow(QMainWindow):
             snapshot_window_s=SNAPSHOT_WINDOW_S,
             time_limit_s=self.time_spin.value(),
             issr_threshold=self.threshold_spin.value(),
-            progress_topic=topic,
         )
 
     # ------------------------------------------------- problem reconstruction --
-    def _rebuild_structure(self, cfg: solver_pb2.ScenarioConfig) -> None:
+    def _rebuild_structure(self, cfg: ScenarioConfig) -> None:
         """Rebuild the QUBO + conflict graph locally and refresh panels 2 & 3."""
         try:
             world, flights, evals, conflicts, buckets = build_scenario_full(cfg)
@@ -1050,8 +1022,7 @@ class MainWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             return
 
-        topic = f"solve/{self.seed_spin.value()}-{int(time.time() * 1000)}"
-        cfg = self._build_cfg(topic)
+        cfg = self._build_cfg()
         self._pending_cfg = cfg
 
         self._rebuild_structure(cfg)
