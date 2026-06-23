@@ -5,23 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "contrail-optimization"
 version = "0.1.0"
-description = "Contrail-aware flight-option optimizer: synthetic airspace environment + CP-SAT solver behind a gRPC/ZMQ service with a PyQt6 desktop client."
+description = "Contrail-aware flight-option optimizer: synthetic airspace environment + CP-SAT and quantum solvers, with a PyQt6 desktop client."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "jaewonyun1234" }]
-keywords = ["optimization", "cp-sat", "contrails", "grpc", "zmq", "pyqt6"]
+keywords = ["optimization", "cp-sat", "contrails", "quantum", "pyqt6"]
 
-# Core runtime = the headless solver service (gRPC + ZMQ). Deliberately does
-# NOT include the PyQt6 desktop dashboard so the deployed server image stays
-# small and free of GUI/X11 system dependencies. The dashboard pulls its deps
-# from the `gui` extra below.
+# Core runtime = the environment + CP-SAT solver. The PyQt6 desktop dashboard
+# is in the `gui` extra so a headless install (tests / benchmark) stays lean.
 dependencies = [
     "numpy>=1.26",
     "ortools>=9.10",
-    "grpcio>=1.60",
-    "grpcio-tools>=1.60",
-    "pyzmq>=25.0",
 ]
 
 [project.optional-dependencies]
@@ -55,26 +50,22 @@ quantum = [
 Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail"
 
 # ---------------------------------------------------------------------------
-# Packaging — two top-level packages live at the repo root.
-# `service.generated` is created at build/CI time by scripts/gen_proto.sh and
-# is intentionally NOT listed (it is gitignored); the editable install exposes
-# the `service` directory so the generated subpackage imports fine once built.
+# Packaging — contrail_env is the one installable package. The gui/ desktop
+# client is run directly (python gui/app.py), not installed.
 # ---------------------------------------------------------------------------
 [tool.setuptools.packages.find]
-# Auto-discover packages present in the build context: contrail_env and service.
 where = ["."]
+include = ["contrail_env*"]
 
 # ---------------------------------------------------------------------------
-# Ruff — lint the code we add in this layer. The nine pre-existing
-# `contrail_env` modules are treated as vendored source (the brief forbids
-# modifying them), so they are excluded; the new solver and the whole service/
-# gui/tests tree are linted normally.
+# Ruff — the pre-existing `contrail_env` modules are treated as vendored source
+# (the brief forbids modifying them) and excluded; new code (the scenario
+# module, gui/, tests/) is linted normally.
 # ---------------------------------------------------------------------------
 [tool.ruff]
 line-length = 100
 extend-exclude = [
     "playground",          # scratch / sandbox notebooks — not linted
-    "service/generated",
     "contrail_env/__init__.py",
     "contrail_env/demo.py",
     "contrail_env/units.py",
@@ -93,15 +84,14 @@ select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]
 
 # ---------------------------------------------------------------------------
-# Mypy — fully type-check the new code. The pre-existing modules cannot be
-# edited, so their (best-effort) type errors are not enforced; the new
-# solver_cpsat module and the service package ARE enforced.
+# Mypy — fully type-check the new code (contrail_env.scenario, gui/). The
+# pre-existing env modules are vendored and not enforced.
 # ---------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = false
-exclude = ["service/generated", "build/"]
+exclude = ["build/"]
 
 # Pre-existing env modules are vendored (the brief forbids editing them), so
 # their best-effort type errors are not enforced.
@@ -118,14 +108,6 @@ module = [
     "contrail_env.demo",
 ]
 ignore_errors = true
-
-# protoc-generated stubs use runtime metaclass magic that static analysis
-# cannot see; treat the whole generated package as Any.
-[[tool.mypy.overrides]]
-module = ["service.generated.*"]
-follow_imports = "skip"
-ignore_errors = true
-ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

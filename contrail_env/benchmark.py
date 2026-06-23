@@ -18,9 +18,9 @@ Statistical hygiene (§10.3): repeated over independent seeds, aggregated
 with bootstrap 95% confidence intervals on the approximation ratio.
 
 The scenario is supplied as a factory `seed -> (evals, conflicts, buckets)`
-so this module stays decoupled from the gRPC layer: the GUI passes a
-factory built from its ScenarioConfig; the CLI below builds one from
-contrail_env defaults.
+so this module stays decoupled from any caller: the GUI passes a factory
+built from its ScenarioConfig; the CLI below builds one from contrail_env
+defaults.
 """
 
 from __future__ import annotations

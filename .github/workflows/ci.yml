@@ -20,65 +20,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Generate gRPC stubs
-        run: bash scripts/gen_proto.sh
-
       - name: Ruff (lint)
         run: ruff check .
 
       - name: Mypy (type-check)
-        run: mypy contrail_env service
+        run: mypy contrail_env
 
       - name: Pytest
         run: pytest -q
-
-  docker-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build solver image
-        run: docker build -t contrail-solver:ci .
-
-      - name: Smoke-test the server boots and accepts connections
-        run: |
-          docker run -d --name solver contrail-solver:ci
-          ok=0
-          for _ in $(seq 1 30); do
-            if docker exec solver python -c \
-              "import socket; socket.create_connection(('localhost', 50051), 2).close()"; then
-              echo "solver is up and accepting connections"; ok=1; break
-            fi
-            sleep 1
-          done
-          docker logs solver
-          docker rm -f solver
-          test "$ok" = 1
-
-  docker-publish:
-    runs-on: ubuntu-latest
-    # Only publish on pushes to main — not on pull requests.
-    # The full suite AND the image smoke-test must pass first.
-    needs: [lint-type-test, docker-build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: read
-      packages: write   # needed to push to ghcr.io
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push image to ghcr.io
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/contrail-solver:latest
-            ghcr.io/${{ github.repository_owner }}/contrail-solver:${{ github.sha }}
