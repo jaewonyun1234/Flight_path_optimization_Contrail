@@ -103,13 +103,17 @@ _MAP_SLICE_FL = 360
 # marker size (px), and the fraction-of-max below which a cell is "clear sky"
 # and skipped so the basemap stays visible.
 _MAP_GRID_NX, _MAP_GRID_NY = 100, 68
-_MAP_MARKER_SIZE = 9
 _MAP_RISK_FLOOR_FRAC = 0.04
-# Animation: number of frames swept across the planning window, and the
-# per-frame dwell (ms) when playing. The route "reveals" (its trail grows) and
-# the aircraft marker glides along it as the time cursor advances.
-_MAP_ANIM_FRAMES = 48
-_MAP_FRAME_MS = 90
+# Marker size for the small inset risk cloud, and the flight-level axis range
+# for the main altitude-profile panel.
+_MAP_INSET_MARKER = 5
+_FL_AXIS_LO, _FL_AXIS_HI = 330, 410
+# Per-flight colours: a flight's filed (dotted) and chosen (solid) profiles
+# share its colour, so colour = which flight, line style = filed vs chosen.
+_FLIGHT_COLORS = [
+    "#4ea1ff", "#ffb648", "#28dc5a", "#ff6ec7",
+    "#b388ff", "#5ad8e6", "#ff7a5c", "#c0e84a",
+]
 # Bundled Natural Earth vectors for the geo basemap (see _geo_assets_script).
 _GEO_TOPOJSON_NAME = "world_50m"
 _GEO_ASSET_PATH = Path(__file__).resolve().parent / "assets" / f"{_GEO_TOPOJSON_NAME}.json"
@@ -141,24 +145,6 @@ def _geo_assets_script() -> str:
     )
 
 
-def _autoplay_script() -> str:
-    """Auto-run the route-reveal animation once the plot is live.
-
-    Plotly doesn't autoplay frames, so we poll for the graph div + library and
-    then kick off Plotly.animate from the first frame. Because _render_map
-    rewrites this page on every solve, the reveal replays each time a solution
-    lands. No-op for a static (frame-less) figure.
-    """
-    return (
-        "<script>(function(){function go(){"
-        "var gd=document.querySelector('.plotly-graph-div');"
-        "if(gd&&window.Plotly&&gd._fullLayout&&gd.frames&&gd.frames.length){"
-        f"Plotly.animate(gd,null,{{frame:{{duration:{_MAP_FRAME_MS},redraw:true}},"
-        "transition:{duration:0},fromcurrent:false,mode:'immediate'});}"
-        "else{setTimeout(go,120);}}setTimeout(go,200);})();</script>"
-    )
-
-
 def _mean_best_cost(instances, solver: str) -> str:
     """Mean best cost of one solver across the benchmark instances."""
     costs = [
@@ -176,63 +162,61 @@ def _mean_best_cost(instances, solver: str) -> str:
 
 @dataclass(frozen=True)
 class RouteLine:
-    """One flight's ground track in geographic coordinates for the map.
-
-    `t_s` is the world time (s) at each vertex; it drives the animation (the
-    trail reveals for vertices with t <= cursor, the aircraft marker rides the
-    interpolated position at the cursor).
-    """
+    """One flight's ground track in geographic coordinates (the inset map)."""
 
     name: str
     lon: np.ndarray
     lat: np.ndarray
-    t_s: np.ndarray
     chosen: bool
 
 
-def _route_state_at(r: RouteLine, t_cursor: float):
-    """A route's revealed trail + aircraft-head position at time `t_cursor`.
+@dataclass(frozen=True)
+class ProfileSeries:
+    """One flight's altitude profile along its track: flight level vs distance.
 
-    The trail is every vertex flown so far (t <= cursor) plus the interpolated
-    current point, so the line ends exactly under the moving marker. np.interp
-    clamps outside the flight window, so before departure the head sits at the
-    origin and after arrival at the destination.
+    `chosen` marks the solver's pick (solid line); otherwise it's the filed
+    baseline (dotted). Both of a flight's lines share `color`, so colour says
+    *which flight* and line style says *filed vs chosen*. `issr_mask[i]` is True
+    where the aircraft — at that point AND that altitude — sits inside a contrail
+    region; those points get a red dot, so you see exactly where a route plows
+    through (or climbs over) the ISSR.
     """
-    t = np.asarray(r.t_s, dtype=float)
-    lon = np.asarray(r.lon, dtype=float)
-    lat = np.asarray(r.lat, dtype=float)
-    h_lon = float(np.interp(t_cursor, t, lon))
-    h_lat = float(np.interp(t_cursor, t, lat))
-    flown = t <= t_cursor
-    trail_lon = np.append(lon[flown], h_lon)
-    trail_lat = np.append(lat[flown], h_lat)
-    return trail_lon, trail_lat, h_lon, h_lat
+
+    name: str
+    s_km: np.ndarray
+    fl: np.ndarray
+    issr_mask: np.ndarray
+    color: str
+    chosen: bool
 
 
-def _trail_trace(go, r: RouteLine, trail_lon, trail_lat):
-    """The growing ground-track line (bright green + thick if chosen)."""
-    return go.Scattergeo(
-        lon=trail_lon, lat=trail_lat, mode="lines",
+def _profile_trace(go, ps: ProfileSeries):
+    """A flight-level-vs-distance line with red dots at ISSR crossings."""
+    issr = np.asarray(ps.issr_mask, dtype=bool)
+    return go.Scatter(
+        x=np.asarray(ps.s_km, dtype=float),
+        y=np.asarray(ps.fl, dtype=float),
+        mode="lines+markers",
         line=dict(
-            width=4 if r.chosen else 1.4,
-            color="#28dc5a" if r.chosen else "rgba(170,172,184,0.5)",
+            width=3 if ps.chosen else 1.6,
+            color=ps.color,
+            dash="solid" if ps.chosen else "dot",
         ),
-        name=f"{r.name} (chosen)" if r.chosen else r.name,
-        hovertemplate=f"{r.name}<extra></extra>",
+        marker=dict(size=np.where(issr, 7.0, 0.0), color="#ff4d4d", line=dict(width=0)),
+        name=f"{ps.name} · chosen" if ps.chosen else f"{ps.name} · filed",
+        hovertemplate=f"{ps.name}<br>FL%{{y:.0f}} @ %{{x:.0f}} km<extra></extra>",
     )
 
 
-def _head_trace(go, r: RouteLine, h_lon, h_lat):
-    """The aircraft marker riding the front of the trail."""
+def _route_trace(go, r: RouteLine):
+    """A static ground track for the inset map (green if chosen, else muted)."""
     return go.Scattergeo(
-        lon=[h_lon], lat=[h_lat], mode="markers",
-        marker=dict(
-            size=14 if r.chosen else 8,
-            symbol="triangle-up",
-            color="#39ff7a" if r.chosen else "rgba(210,212,224,0.85)",
-            line=dict(width=1.2 if r.chosen else 0.6, color="#0e0e10"),
-        ),
-        name=r.name, showlegend=False,
+        lon=np.asarray(r.lon, dtype=float),
+        lat=np.asarray(r.lat, dtype=float),
+        mode="lines",
+        line=dict(width=2.5 if r.chosen else 1.0,
+                  color="#28dc5a" if r.chosen else "rgba(170,172,184,0.5)"),
+        showlegend=False,
         hovertemplate=f"{r.name}<extra></extra>",
     )
 
@@ -240,155 +224,80 @@ def _head_trace(go, r: RouteLine, h_lon, h_lat):
 def build_map_figure(
     *,
     source: str,
+    profiles: list[ProfileSeries],
     lon: np.ndarray,
     lat: np.ndarray,
     risk: np.ndarray,
     routes: list[RouteLine],
-    animate: bool = True,
 ):
-    """Build the geographic Map figure: ISSR risk overlay + animated flight routes.
+    """Build the Map tab figure: a big altitude-profile panel + a small inset map.
 
-    Pure function of plain arrays so it carries no Qt/web dependency and can be
-    unit-tested directly. `lon`/`lat`/`risk` are the (same-shape) sampled risk
-    field; `routes` are per-flight ground tracks in lon/lat with per-vertex
-    times (`RouteLine.t_s`).
+    The optimiser only changes ALTITUDE, so a top-down map can't tell the filed
+    route from the chosen one — their ground tracks are identical. The main panel
+    therefore plots flight level vs along-track distance: the filed baseline
+    (dotted) against the chosen profile (solid), with a red dot wherever the
+    aircraft, at that altitude, is inside a contrail region. The familiar
+    geographic ISSR map rides along as a small inset (top-right) for context.
 
-    When `animate` and the routes span a time window, the figure carries Plotly
-    `frames` (one per time step) plus a play/pause control and a slider: each
-    route's trail grows and an aircraft marker glides along it as the cursor
-    sweeps the planning window. The risk overlay is static (trace 0); each route
-    contributes a trail trace then a head trace, so frames update indices 1..2N
-    and leave the overlay untouched.
-
-    Rendered on Plotly's `geo` subplot (SVG / Natural Earth vectors) rather than
-    a WebGL tile map, so it draws real country borders + coastlines and displays
-    even where WebGL is blocked (locked-down / headless Chromium).
+    Pure function of plain arrays, so it unit-tests directly. Drawn with Plotly:
+    the profiles on xy axes, the inset on a `geo` subplot (SVG Natural Earth
+    vectors — renders with no WebGL / CDN).
     """
     import plotly.graph_objects as go  # lazy: keep module import lean
 
+    fig = go.Figure()
+
+    # --- main panel: altitude profiles (xy axes) ---
+    for ps in profiles:
+        fig.add_trace(_profile_trace(go, ps))
+
+    # --- inset map: ISSR risk cloud + ground tracks (geo subplot, top-right) ---
     lon_f = np.asarray(lon, dtype=float).ravel()
     lat_f = np.asarray(lat, dtype=float).ravel()
     risk_f = np.asarray(risk, dtype=float).ravel()
-
-    fig = go.Figure()
-
-    # --- trace 0: ISSR risk as a graded marker cloud over the basemap. `geo`
-    # has no native density trace, so we draw the grid samples as markers, skip
-    # near-zero "clear sky" cells, and scale each marker by its risk so hotter
-    # air reads as bigger + brighter (a softer, denser look than flat dots).
     rmax = float(np.nanmax(risk_f)) if risk_f.size else 0.0
     keep = risk_f > (_MAP_RISK_FLOOR_FRAC * rmax) if rmax > 0 else np.zeros_like(risk_f, bool)
     kr = risk_f[keep]
-    sizes = _MAP_MARKER_SIZE * (0.45 + 1.1 * (kr / rmax)) if rmax > 0 else _MAP_MARKER_SIZE
+    sizes = _MAP_INSET_MARKER * (0.5 + 1.0 * (kr / rmax)) if rmax > 0 else _MAP_INSET_MARKER
     fig.add_trace(
         go.Scattergeo(
-            lon=lon_f[keep],
-            lat=lat_f[keep],
-            mode="markers",
-            marker=dict(
-                size=sizes,
-                color=kr,
-                colorscale="Inferno",
-                cmin=0.0,
-                cmax=rmax if rmax > 0 else 1.0,
-                opacity=0.6,
-                line=dict(width=0),
-                colorbar=dict(title="ISSR<br>risk", thickness=12, len=0.6, x=0.99),
-            ),
-            name="ISSR risk",
-            hoverinfo="skip",
+            lon=lon_f[keep], lat=lat_f[keep], mode="markers",
+            marker=dict(size=sizes, color=kr, colorscale="Inferno",
+                        cmin=0.0, cmax=rmax if rmax > 0 else 1.0,
+                        opacity=0.6, line=dict(width=0), showscale=False),
+            name="ISSR risk", showlegend=False, hoverinfo="skip",
         )
     )
-
-    # Decide whether to animate: need routes with a non-degenerate time span.
-    times = None
-    if animate and routes:
-        t0 = min(float(np.asarray(r.t_s, dtype=float)[0]) for r in routes)
-        t1 = max(float(np.asarray(r.t_s, dtype=float)[-1]) for r in routes)
-        if t1 > t0:
-            times = np.linspace(t0, t1, _MAP_ANIM_FRAMES)
-
-    # --- traces 1..2N: per route, a trail line then a head marker. The base
-    # figure shows the first frame (t0) when animating, else the full route.
     for r in routes:
-        if times is not None:
-            tl_lon, tl_lat, h_lon, h_lat = _route_state_at(r, float(times[0]))
-        else:
-            tl_lon = np.asarray(r.lon, dtype=float)
-            tl_lat = np.asarray(r.lat, dtype=float)
-            h_lon, h_lat = float(tl_lon[-1]), float(tl_lat[-1])
-        fig.add_trace(_trail_trace(go, r, tl_lon, tl_lat))
-        fig.add_trace(_head_trace(go, r, h_lon, h_lat))
+        fig.add_trace(_route_trace(go, r))
 
-    # --- frames + play/pause + slider (features: route reveal AND time-step) ---
-    if times is not None:
-        anim_indices = list(range(1, 1 + 2 * len(routes)))
-        frames = []
-        for k, tc in enumerate(times):
-            data = []
-            for r in routes:
-                tl_lon, tl_lat, h_lon, h_lat = _route_state_at(r, float(tc))
-                data.append(_trail_trace(go, r, tl_lon, tl_lat))
-                data.append(_head_trace(go, r, h_lon, h_lat))
-            frames.append(go.Frame(name=str(k), data=data, traces=anim_indices))
-        fig.frames = frames
-
-        play = dict(
-            label="▶ Play", method="animate",
-            args=[None, dict(frame=dict(duration=_MAP_FRAME_MS, redraw=True),
-                             fromcurrent=True, transition=dict(duration=0),
-                             mode="immediate")],
-        )
-        pause = dict(
-            label="⏸ Pause", method="animate",
-            args=[[None], dict(frame=dict(duration=0, redraw=False),
-                               mode="immediate", transition=dict(duration=0))],
-        )
-        fig.update_layout(
-            updatemenus=[dict(
-                type="buttons", direction="left", showactive=False,
-                x=0.01, y=0.02, xanchor="left", yanchor="bottom",
-                bgcolor="rgba(20,20,24,0.6)", font=dict(color="#dddde2"),
-                buttons=[play, pause],
-            )],
-            sliders=[dict(
-                active=0, x=0.12, len=0.8, y=0.02, yanchor="bottom",
-                bgcolor="rgba(20,20,24,0.6)", font=dict(color="#bdbdc6", size=10),
-                currentvalue=dict(prefix="t = ", suffix=" min", font=dict(color="#dddde2")),
-                steps=[dict(
-                    method="animate", label=f"{tc / 60:.0f}",
-                    args=[[str(k)], dict(mode="immediate",
-                                         frame=dict(duration=0, redraw=True),
-                                         transition=dict(duration=0))],
-                ) for k, tc in enumerate(times)],
-            )],
-        )
-
-    # Frame the view on the data box with a small margin; dark land/ocean makes
-    # the warm risk cloud and green routes pop.
+    # Frame the inset on the data box.
     margin = 1.0
     lon_lo = float(np.nanmin(lon_f)) - margin if lon_f.size else -6.0
     lon_hi = float(np.nanmax(lon_f)) + margin if lon_f.size else 16.0
     lat_lo = float(np.nanmin(lat_f)) - margin if lat_f.size else 42.0
     lat_hi = float(np.nanmax(lat_f)) + margin if lat_f.size else 51.0
     fig.update_geos(
-        projection_type="mercator",
-        resolution=50,
-        lonaxis_range=[lon_lo, lon_hi],
-        lataxis_range=[lat_lo, lat_hi],
+        domain=dict(x=[0.66, 0.995], y=[0.58, 0.99]),   # top-right inset
+        projection_type="mercator", resolution=50,
+        lonaxis_range=[lon_lo, lon_hi], lataxis_range=[lat_lo, lat_hi],
         showland=True, landcolor="#1a1b20",
         showocean=True, oceancolor="#0b0c10",
         showcountries=True, countrycolor="rgba(255,255,255,0.22)",
         showcoastlines=True, coastlinecolor="rgba(255,255,255,0.3)",
-        showlakes=False,
-        bgcolor="#0e0e10",
+        showlakes=False, bgcolor="#0e0e10",
     )
     fig.update_layout(
-        margin=dict(l=0, r=0, t=34, b=0),
-        title=dict(text=f"ISSR risk + routes — source: {source} (slice FL{_MAP_SLICE_FL})", x=0.5),
-        paper_bgcolor="#0e0e10",
+        margin=dict(l=64, r=12, t=42, b=48),
+        title=dict(text=f"Altitude profiles — filed (dotted) vs chosen (solid)   ·   "
+                        f"inset: ISSR map ({source})", x=0.5),
+        xaxis=dict(title="along-track distance (km)", gridcolor="rgba(255,255,255,0.08)",
+                   zeroline=False, color="#cfcfd6"),
+        yaxis=dict(title="flight level (FL)", range=[_FL_AXIS_LO, _FL_AXIS_HI],
+                   gridcolor="rgba(255,255,255,0.08)", zeroline=False, color="#cfcfd6"),
+        paper_bgcolor="#0e0e10", plot_bgcolor="#0e0e10",
         font=dict(color="#dddde2"),
-        legend=dict(bgcolor="rgba(20,20,24,0.6)", x=0.01, y=0.99),
+        legend=dict(bgcolor="rgba(20,20,24,0.6)", x=0.01, y=0.99, font=dict(size=10)),
     )
     return fig
 
@@ -835,26 +744,50 @@ class MainWindow(QMainWindow):
             wps = waypoints_for(flight, profile)
             wx = np.array([w[0] for w in wps], dtype=float)
             wy = np.array([w[1] for w in wps], dtype=float)
-            wt = np.array([w[3] for w in wps], dtype=float)  # world time per vertex
             lon, lat = anchor.local_to_geo(wx, wy)
             routes.append(
                 RouteLine(
                     name=flight.name,
                     lon=np.asarray(lon, dtype=float),
                     lat=np.asarray(lat, dtype=float),
-                    t_s=wt,
                     chosen=is_chosen,
                 )
             )
         return routes
 
-    def _render_map(self, chosen_by_flight: dict[str, int] | None) -> None:
-        """Render the ISSR-risk overlay + flight routes onto the geographic map.
+    def _one_series(self, flight, profile, color: str, chosen: bool) -> ProfileSeries:
+        """An altitude profile (FL vs along-track distance) + per-point ISSR mask."""
+        wps = waypoints_for(flight, profile)
+        x = np.array([w[0] for w in wps], dtype=float)
+        y = np.array([w[1] for w in wps], dtype=float)
+        z = np.array([w[2] for w in wps], dtype=float)
+        s_km = np.hypot(x - x[0], y - y[0])          # distance flown from origin
+        fl = z / 0.3048 / 100.0                      # metres -> flight level
+        issr = np.asarray(self._world.issr.mask_grid(x, y, z), dtype=bool)
+        return ProfileSeries(name=flight.name, s_km=s_km, fl=fl, issr_mask=issr,
+                             color=color, chosen=chosen)
 
-        Uses the ISSRField's rhi_excess_grid interface. On a 2-D map the altitude dimension
-        collapses, so each flight is one ground track; once solved, chosen routes
-        are drawn green over the muted context. Builds a Plotly figure and loads
-        its self-contained HTML into the embedded web view.
+    def _profile_series(self, chosen_by_flight: dict[str, int] | None) -> list[ProfileSeries]:
+        """Per flight: its filed baseline, plus the chosen profile once solved."""
+        series: list[ProfileSeries] = []
+        for idx, flight in enumerate(self._flights):
+            color = _FLIGHT_COLORS[idx % len(_FLIGHT_COLORS)]
+            series.append(self._one_series(flight, flight.baseline, color, chosen=False))
+            if chosen_by_flight and flight.name in chosen_by_flight:
+                members = self._groups.get(flight.name, [])
+                k = chosen_by_flight[flight.name]
+                if 0 <= k < len(members):
+                    prof = self._evals[members[k]].profile
+                    series.append(self._one_series(flight, prof, color, chosen=True))
+        return series
+
+    def _render_map(self, chosen_by_flight: dict[str, int] | None) -> None:
+        """Render the altitude-profile panel + the inset ISSR map.
+
+        The main panel shows flight level vs along-track distance (filed vs
+        chosen, with ISSR crossings marked) so the optimiser's altitude decision
+        is visible; the inset gives geographic context. The risk field for the
+        inset is sampled at a fixed altitude slice and mapped to lon/lat.
         """
         if self._world is None:
             return
@@ -872,8 +805,10 @@ class MainWindow(QMainWindow):
         lons, lats = anchor.local_to_geo(xx, yy)
 
         routes = self._map_routes(chosen_by_flight, anchor)
+        profiles = self._profile_series(chosen_by_flight)
         source = getattr(field, "source", "synthetic")
-        fig = build_map_figure(source=source, lon=lons, lat=lats, risk=risk, routes=routes)
+        fig = build_map_figure(source=source, profiles=profiles,
+                               lon=lons, lat=lats, risk=risk, routes=routes)
 
         # Write a self-contained page (plotly.js inlined) and load it from disk —
         # setHtml caps payloads at ~2 MB, which the inlined library exceeds. A
@@ -884,8 +819,6 @@ class MainWindow(QMainWindow):
         assets = _geo_assets_script()
         if assets:
             html = html.replace("</head>", assets + "</head>", 1)
-        # Auto-run the reveal once the plot is live (replays on every solve).
-        html = html.replace("</body>", _autoplay_script() + "</body>", 1)
         with open(self._map_html_path, "w", encoding="utf-8") as fh:
             fh.write(html)
         if self.map_view is not None:
