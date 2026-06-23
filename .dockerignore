@@ -28,19 +28,6 @@ venv/
 .venv/
 .env
 
-# contrail_ml and contrail_flights are excluded entirely — ML training/inference
-# and the OpenSky real-traffic loader are separate concerns with their own heavy
-# deps (scipy/sklearn/xgboost/mlflow; pyopensky/pandas/pyarrow). The server image
-# has one job: run the CP-SAT gRPC service. Both run offline in their own envs.
-contrail_ml/
-contrail_flights/
-
-# contrail_ml artifacts
-mlruns/
-data/processed/
-*.joblib
-*.npz
-
 # Editor / OS noise and local notes
 .DS_Store
 *.ipynb_checkpoints/

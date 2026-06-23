@@ -41,39 +41,6 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.4",
 ]
-# Observation-grounded ISSR model + full MLOps lifecycle. Install with:
-#   pip install -e ".[ml]"
-# Deliberately NOT in the core deps: the deployed solver image (Dockerfile
-# runtime stage) must stay lean and free of the heavy scientific/geo stack.
-# The geo loaders (pycontrails/xarray/cfgrib/zarr/gcsfs/netCDF4/dask) are only
-# needed to BUILD a dataset from real weather; training/serving/tests on a
-# prepared parquet need only the tabular stack (pandas/scipy/sklearn/xgboost).
-ml = [
-    "pycontrails>=0.60",
-    "xarray>=2024.0",
-    "netCDF4",
-    "cfgrib",            # GFS is GRIB
-    "zarr",
-    "gcsfs",             # ARCO-ERA5 is zarr on a public GCS bucket
-    "dask",
-    "pandas>=2.0",
-    "pyarrow",
-    "scipy",
-    "scikit-learn>=1.4",
-    "xgboost>=2.0",
-    "mlflow>=2.12",
-    "matplotlib",        # reliability / diagnostic plots logged to MLflow
-    "tabulate",          # markdown rendering of the comparison table for MLflow
-]
-# Real historical-traffic loader (OpenSky). The package's geometry + reduction
-# run on numpy alone; this extra is only needed to actually PULL and CACHE real
-# tracks (pyopensky + the tabular stack). Like [ml], it is NOT in the core deps,
-# so the deployed solver image stays lean.
-flights = [
-    "pyopensky>=2.0",
-    "pandas>=2.0",
-    "pyarrow",
-]
 # Real quantum SDK backends. The pipelines run WITHOUT these (built-in
 # statevector / exact-hafnian samplers); installing them switches
 # pasqal_analog to Pulser's QuTiP emulator and xanadu_gbs to Strawberry
@@ -94,10 +61,7 @@ Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail
 # the `service` directory so the generated subpackage imports fine once built.
 # ---------------------------------------------------------------------------
 [tool.setuptools.packages.find]
-# Auto-discover packages present in the build context. Locally this finds
-# contrail_env, service, contrail_ml, and contrail_ml.data. Inside the Docker
-# build context, contrail_ml is excluded via .dockerignore so only
-# contrail_env and service are found — pip install . succeeds either way.
+# Auto-discover packages present in the build context: contrail_env and service.
 where = ["."]
 
 # ---------------------------------------------------------------------------
@@ -109,6 +73,7 @@ where = ["."]
 [tool.ruff]
 line-length = 100
 extend-exclude = [
+    "playground",          # scratch / sandbox notebooks — not linted
     "service/generated",
     "contrail_env/__init__.py",
     "contrail_env/demo.py",
@@ -126,12 +91,6 @@ extend-exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]
-
-# The ML test modules call pytest.importorskip(...) before importing contrail_ml
-# so the core lint-type-test job (no [ml] extra) skips them instead of erroring.
-# That guard must run before the imports it protects, which is exactly E402.
-[tool.ruff.lint.per-file-ignores]
-"tests/test_ml_*.py" = ["E402"]
 
 # ---------------------------------------------------------------------------
 # Mypy — fully type-check the new code. The pre-existing modules cannot be
