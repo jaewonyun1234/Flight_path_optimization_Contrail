@@ -337,6 +337,31 @@ class SolveWorker(QThread):
             self.finished_ok.emit(result)
 
 
+class _AnalysisWorker(QThread):
+    """Runs a (possibly slow) analysis off the UI thread.
+
+    `fn(emit)` receives a callback to stream intermediate results; whatever it
+    returns is delivered via `done`. Used by the research tabs (landscape /
+    quantum convergence / hardness sweep) so the dashboard never blocks.
+    """
+
+    done = pyqtSignal(object)
+    progress = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            result = self._fn(self.progress.emit)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the status label
+            self.failed.emit(str(exc))
+        else:
+            self.done.emit(result)
+
+
 # =============================================================================
 # BENCHMARK WORKER — runs the plan §10 protocol locally, off the UI thread
 # =============================================================================
@@ -403,20 +428,24 @@ class MainWindow(QMainWindow):
         self._bench_worker: BenchmarkWorker | None = None
         self._pending_cfg: ScenarioConfig | None = None
 
+        # Research-tab workers (landscape / quantum convergence / hardness sweep).
+        self._land_worker: _AnalysisWorker | None = None
+        self._qconv_worker: _AnalysisWorker | None = None
+        self._hard_worker: _AnalysisWorker | None = None
+        self._qconv_data: dict[str, tuple[list, list]] = {"pasqal": ([], []), "gbs": ([], [])}
+
         # Benchmark progress state (see _on_bench_phase / _refresh_bench_status).
         self._bench_t0 = 0.0
         self._bench_cells_done = 0
         self._bench_msg = ""
 
-        self._xs: list[int] = []
-        self._ys: list[float] = []
-
         # Reconstructed problem state (set by _rebuild_structure).
         self._evals: list = []
         self._conflicts: list = []
+        self._buckets: list = []
         self._groups: OrderedDict[str, list[int]] = OrderedDict()
         self._graph_texts: list[pg.TextItem] = []
-        # World + flights kept for the geographic map panel (tab 6).
+        # World + flights kept for the geographic map panel.
         self._world: object | None = None
         self._flights: list = []
 
@@ -488,12 +517,14 @@ class MainWindow(QMainWindow):
 
         # --- Tabs -----------------------------------------------------------
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_convergence_tab(), "1 · Convergence")
-        self.tabs.addTab(self._build_graph_tab(), "2 · Conflict graph")
-        self.tabs.addTab(self._build_qubo_tab(), "3 · QUBO analytics")
-        self.tabs.addTab(self._build_results_tab(), "4 · Trade-offs")
-        self.tabs.addTab(self._build_benchmark_tab(), "5 · Quantum benchmark")
-        self.tabs.addTab(self._build_map_tab(), "6 · Map")
+        self.tabs.addTab(self._build_landscape_tab(), "1 · Energy landscape")
+        self.tabs.addTab(self._build_quantum_conv_tab(), "2 · Quantum convergence")
+        self.tabs.addTab(self._build_hardness_tab(), "3 · Hardness sweep")
+        self.tabs.addTab(self._build_graph_tab(), "4 · Conflict graph")
+        self.tabs.addTab(self._build_qubo_tab(), "5 · QUBO analytics")
+        self.tabs.addTab(self._build_results_tab(), "6 · Trade-offs")
+        self.tabs.addTab(self._build_benchmark_tab(), "7 · Quantum benchmark")
+        self.tabs.addTab(self._build_map_tab(), "8 · Map")
 
         root = QHBoxLayout()
         root.addWidget(left_widget)
@@ -502,15 +533,245 @@ class MainWindow(QMainWindow):
         central.setLayout(root)
         self.setCentralWidget(central)
 
-    def _build_convergence_tab(self) -> QWidget:
-        self.conv_plot = pg.PlotWidget(title="CP-SAT incumbent objective (live)")
-        self.conv_plot.setLabel("bottom", "improvement index")
-        self.conv_plot.setLabel("left", "objective (combined cost)")
-        self.conv_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.conv_curve = self.conv_plot.plot(
-            [], [], pen=pg.mkPen("c", width=2), symbol="o", symbolSize=7
+    # ----------------------------------------------------- tab 1: landscape ---
+    def _build_landscape_tab(self) -> QWidget:
+        self.land_btn = QPushButton("Compute landscape (+ GBS / random samples)")
+        self.land_btn.clicked.connect(self._on_landscape)
+        self.land_status = QLabel(
+            "idle — enumerates every feasible solution's cost and overlays where "
+            "the GBS sampler vs random actually land. Click after building an instance."
         )
-        return self.conv_plot
+        self.land_status.setFont(_MONO)
+
+        self.land_plot = pg.PlotWidget(
+            title="Solution-cost landscape — where the optimum sits, and where samplers land"
+        )
+        self.land_plot.setLabel("bottom", "combined cost (lower = better)")
+        self.land_plot.setLabel("left", "frequency")
+        self.land_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.land_plot.addLegend()
+        self.land_all = self.land_plot.plot([], [], pen=pg.mkPen((90, 140, 220)), name="all feasible")
+        self.land_rnd = self.land_plot.plot([], [], pen=pg.mkPen((180, 180, 180)), name="random")
+        self.land_gbs = self.land_plot.plot([], [], pen=pg.mkPen((40, 220, 120)), name="GBS")
+        self.land_opt = pg.InfiniteLine(angle=90, pen=pg.mkPen("g", width=2, style=Qt.PenStyle.DashLine))
+        self.land_plot.addItem(self.land_opt)
+
+        controls = QHBoxLayout()
+        controls.addWidget(self.land_btn)
+        controls.addWidget(self.land_status, stretch=1)
+        lay = QVBoxLayout()
+        lay.addLayout(controls)
+        lay.addWidget(self.land_plot, stretch=1)
+        wrap = QWidget()
+        wrap.setLayout(lay)
+        return wrap
+
+    def _on_landscape(self) -> None:
+        if self._land_worker is not None and self._land_worker.isRunning():
+            return
+        if not self._evals:
+            self.land_status.setText("build an instance first (Randomize)")
+            return
+        evals, conflicts, buckets = self._evals, self._conflicts, self._buckets
+        seed = self.seed_spin.value()
+
+        def job(_emit):
+            from contrail_env.analysis import (
+                feasible_cost_landscape,
+                gbs_sample_costs,
+                random_sample_costs,
+            )
+            costs, optimum = feasible_cost_landscape(evals, conflicts, buckets)
+            gbs = gbs_sample_costs(evals, conflicts, buckets, n_samples=500, seed=seed)
+            rnd = random_sample_costs(evals, conflicts, buckets, n_samples=500, seed=seed)
+            return costs, gbs, rnd, optimum
+
+        self.land_btn.setEnabled(False)
+        self.land_status.setText("computing…")
+        self._land_worker = _AnalysisWorker(job)
+        self._land_worker.done.connect(self._on_landscape_done)
+        self._land_worker.failed.connect(self._on_landscape_failed)
+        self._land_worker.start()
+
+    def _on_landscape_done(self, result) -> None:
+        costs, gbs, rnd, optimum = result
+        allv = np.concatenate([costs, gbs, rnd])
+        lo, hi = float(allv.min()), float(allv.max())
+        edges = np.linspace(lo, hi if hi > lo else lo + 1.0, 31)
+
+        def hist(curve, vals, brush):
+            y, _ = np.histogram(np.asarray(vals, dtype=float), bins=edges)
+            curve.setData(edges, y, stepMode="center", fillLevel=0, brush=brush)
+
+        hist(self.land_all, costs, (90, 140, 220, 110))
+        hist(self.land_rnd, rnd, (180, 180, 180, 110))
+        hist(self.land_gbs, gbs, (40, 220, 120, 130))
+        self.land_opt.setValue(optimum)
+        self.land_status.setText(
+            f"{costs.size} feasible solutions · optimum = {optimum:.1f} · "
+            f"GBS best = {float(gbs.min()):.1f} · random best = {float(rnd.min()):.1f}  "
+            f"(does GBS pile up nearer the optimum than random?)"
+        )
+        self.land_btn.setEnabled(True)
+
+    def _on_landscape_failed(self, msg: str) -> None:
+        self.land_status.setText(f"failed: {msg}")
+        self.land_btn.setEnabled(True)
+
+    # ------------------------------------------ tab 2: quantum convergence ---
+    def _build_quantum_conv_tab(self) -> QWidget:
+        self.qconv_btn = QPushButton("Run quantum solvers on current instance")
+        self.qconv_btn.clicked.connect(self._on_quantum_conv)
+        self.qconv_status = QLabel(
+            "idle — runs Pasqal QAOA + Xanadu GBS on the current instance and tracks "
+            "best-cost-so-far vs work (a convergence curve that actually moves)."
+        )
+        self.qconv_status.setFont(_MONO)
+
+        self.qconv_plot = pg.PlotWidget(
+            title="Quantum convergence — best repaired cost vs work (lower = better)"
+        )
+        self.qconv_plot.setLabel("bottom", "progress (BO eval / sample batch)")
+        self.qconv_plot.setLabel("left", "best combined cost so far")
+        self.qconv_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.qconv_plot.addLegend()
+        self.qconv_pasqal = self.qconv_plot.plot(
+            [], [], pen=pg.mkPen("m", width=2), symbol="o", symbolSize=6, name="Pasqal QAOA")
+        self.qconv_gbs = self.qconv_plot.plot(
+            [], [], pen=pg.mkPen("y", width=2), symbol="o", symbolSize=6, name="Xanadu GBS")
+        self.qconv_opt = pg.InfiniteLine(angle=0, pen=pg.mkPen("g", style=Qt.PenStyle.DashLine))
+        self.qconv_plot.addItem(self.qconv_opt)
+
+        controls = QHBoxLayout()
+        controls.addWidget(self.qconv_btn)
+        controls.addWidget(self.qconv_status, stretch=1)
+        lay = QVBoxLayout()
+        lay.addLayout(controls)
+        lay.addWidget(self.qconv_plot, stretch=1)
+        wrap = QWidget()
+        wrap.setLayout(lay)
+        return wrap
+
+    def _on_quantum_conv(self) -> None:
+        if self._qconv_worker is not None and self._qconv_worker.isRunning():
+            return
+        if not self._evals:
+            self.qconv_status.setText("build an instance first (Randomize)")
+            return
+        evals, conflicts, buckets = self._evals, self._conflicts, self._buckets
+        seed = self.seed_spin.value()
+
+        def job(emit):
+            from contrail_env.pasqal_analog import solve_pasqal_analog
+            from contrail_env.solver_cpsat import solve_cpsat
+            from contrail_env.xanadu_gbs import solve_xanadu_gbs
+            emit(("optimum", solve_cpsat(evals, conflicts, buckets, time_limit_s=5.0).objective))
+            solve_pasqal_analog(evals, conflicts, buckets, bo_iters=12, seed=seed,
+                                on_progress=lambda i, c: emit(("pasqal", i, c)))
+            solve_xanadu_gbs(evals, conflicts, buckets, n_samples=800, seed=seed,
+                             on_progress=lambda s, c: emit(("gbs", s, c)))
+            return None
+
+        self._qconv_data = {"pasqal": ([], []), "gbs": ([], [])}
+        self.qconv_pasqal.setData([], [])
+        self.qconv_gbs.setData([], [])
+        self.qconv_btn.setEnabled(False)
+        self.qconv_status.setText("running… (Pasqal QAOA can take a few seconds)")
+        self._qconv_worker = _AnalysisWorker(job)
+        self._qconv_worker.progress.connect(self._on_qconv_progress)
+        self._qconv_worker.done.connect(self._on_qconv_done)
+        self._qconv_worker.failed.connect(self._on_qconv_failed)
+        self._qconv_worker.start()
+
+    def _on_qconv_progress(self, msg) -> None:
+        if msg[0] == "optimum":
+            self.qconv_opt.setValue(float(msg[1]))
+            return
+        key = "pasqal" if msg[0] == "pasqal" else "gbs"
+        xs, ys = self._qconv_data[key]
+        xs.append(msg[1])
+        ys.append(msg[2])
+        (self.qconv_pasqal if key == "pasqal" else self.qconv_gbs).setData(xs, ys)
+
+    def _on_qconv_done(self, _result) -> None:
+        self.qconv_btn.setEnabled(True)
+        self.qconv_status.setText("done — curves are best-cost-so-far; the dashed line is the CP-SAT optimum")
+
+    def _on_qconv_failed(self, msg: str) -> None:
+        self.qconv_btn.setEnabled(True)
+        self.qconv_status.setText(f"failed: {msg}")
+
+    # ------------------------------------------------ tab 3: hardness sweep ---
+    def _build_hardness_tab(self) -> QWidget:
+        self.hard_max = QSpinBox()
+        self.hard_max.setRange(4, 16)
+        self.hard_max.setValue(10)
+        self.hard_btn = QPushButton("Run sweep")
+        self.hard_btn.clicked.connect(self._on_hardness)
+        self.hard_status = QLabel(
+            "idle — solves a fresh instance at each size 2..N and records CP-SAT "
+            "effort. A flat incumbents=1 line means the exact solver one-shots it."
+        )
+        self.hard_status.setFont(_MONO)
+
+        self.hard_time_plot = pg.PlotWidget(title="CP-SAT wall time vs problem size")
+        self.hard_time_plot.setLabel("bottom", "flights")
+        self.hard_time_plot.setLabel("left", "wall time (ms)")
+        self.hard_time_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.hard_time_curve = self.hard_time_plot.plot(
+            [], [], pen=pg.mkPen("c", width=2), symbol="o", symbolSize=7)
+
+        self.hard_inc_plot = pg.PlotWidget(
+            title="CP-SAT incumbents found vs size (flat = trivially easy)")
+        self.hard_inc_plot.setLabel("bottom", "flights")
+        self.hard_inc_plot.setLabel("left", "# incumbents")
+        self.hard_inc_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.hard_inc_curve = self.hard_inc_plot.plot(
+            [], [], pen=pg.mkPen("m", width=2), symbol="o", symbolSize=7)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("max flights"))
+        controls.addWidget(self.hard_max)
+        controls.addWidget(self.hard_btn)
+        controls.addWidget(self.hard_status, stretch=1)
+        lay = QVBoxLayout()
+        lay.addLayout(controls)
+        lay.addWidget(self.hard_time_plot, stretch=1)
+        lay.addWidget(self.hard_inc_plot, stretch=1)
+        wrap = QWidget()
+        wrap.setLayout(lay)
+        return wrap
+
+    def _on_hardness(self) -> None:
+        if self._hard_worker is not None and self._hard_worker.isRunning():
+            return
+        seed = self.seed_spin.value()
+        sizes = list(range(2, self.hard_max.value() + 1))
+
+        def job(_emit):
+            from contrail_env.analysis import hardness_sweep
+            return hardness_sweep(sizes, seed=seed, time_limit_s=3.0)
+
+        self.hard_btn.setEnabled(False)
+        self.hard_status.setText("running sweep… (solves one instance per size)")
+        self._hard_worker = _AnalysisWorker(job)
+        self._hard_worker.done.connect(self._on_hardness_done)
+        self._hard_worker.failed.connect(self._on_hardness_failed)
+        self._hard_worker.start()
+
+    def _on_hardness_done(self, out) -> None:
+        self.hard_time_curve.setData(out["sizes"], out["cpsat_ms"])
+        self.hard_inc_curve.setData(out["sizes"], out["incumbents"])
+        self.hard_status.setText(
+            f"done · {int(out['sizes'].min())}–{int(out['sizes'].max())} flights · "
+            f"max {float(out['cpsat_ms'].max()):.0f} ms · "
+            f"incumbents {int(out['incumbents'].min())}–{int(out['incumbents'].max())}"
+        )
+        self.hard_btn.setEnabled(True)
+
+    def _on_hardness_failed(self, msg: str) -> None:
+        self.hard_status.setText(f"failed: {msg}")
+        self.hard_btn.setEnabled(True)
 
     def _build_graph_tab(self) -> QWidget:
         self.graph_plot = pg.PlotWidget(
@@ -855,6 +1116,7 @@ class MainWindow(QMainWindow):
         self._flights = flights
         self._evals = evals
         self._conflicts = conflicts
+        self._buckets = buckets
         groups: OrderedDict[str, list[int]] = OrderedDict()
         for idx, ev in enumerate(evals):
             groups.setdefault(ev.flight_name, []).append(idx)
@@ -946,8 +1208,6 @@ class MainWindow(QMainWindow):
     def _on_randomize(self) -> None:
         # New seed re-rolls the instance; preview its structure without solving.
         self.seed_spin.setValue(random.randint(0, 9999))
-        self._xs, self._ys = [], []
-        self.conv_curve.setData([], [])
         self.results.setRowCount(0)
         self._rebuild_structure(self._build_cfg())
 
@@ -959,22 +1219,14 @@ class MainWindow(QMainWindow):
         self._pending_cfg = cfg
 
         self._rebuild_structure(cfg)
-        self._xs, self._ys = [], []
-        self.conv_curve.setData([], [])
         self.results.setRowCount(0)
         self.summary.setText("solving…")
         self.solve_btn.setEnabled(False)
 
         self._worker = SolveWorker(cfg)
-        self._worker.progress.connect(self._on_progress)
         self._worker.finished_ok.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
-
-    def _on_progress(self, improvement: int, objective: float) -> None:
-        self._xs.append(improvement)
-        self._ys.append(objective)
-        self.conv_curve.setData(self._xs, self._ys)
 
     def _on_finished(self, resp: object) -> None:
         choices = resp.choices  # type: ignore[attr-defined]
