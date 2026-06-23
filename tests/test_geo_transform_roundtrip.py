@@ -1,13 +1,13 @@
-"""The flight loader's geo transform inverts cleanly and matches the model's.
+"""The map's geo transform inverts cleanly: geo_to_local(local_to_geo(x,y)) == (x,y).
 
-geo_to_local(local_to_geo(x, y)) == (x, y), and the (deliberately duplicated)
-contrail_flights anchor agrees with contrail_ml's so the map and the real
-flights share one coordinate system.
+The Map tab places the local sim box on a lon/lat basemap via contrail_env.geo;
+this guards that the forward/inverse pair is consistent so routes and the risk
+overlay land where they should.
 """
 
 import numpy as np
 
-from contrail_flights.geo import GeoAnchor
+from contrail_env.geo import EUROPEAN_ANCHOR, GeoAnchor
 
 
 def test_roundtrip_vectorized():
@@ -29,16 +29,8 @@ def test_roundtrip_scalar_returns_floats():
     assert abs(x - 750.0) < 1e-6 and abs(y - 400.0) < 1e-6
 
 
-def test_matches_contrail_ml_anchor():
-    # The independent copy MUST agree with the model's anchor (same origin),
-    # or the predicted field and the real flights would land in different places.
-    from contrail_ml.config import MLConfig
-    from contrail_ml.features import GeoAnchor as MLAnchor
-
-    cfg = MLConfig()
-    flights_anchor = GeoAnchor()
-    ml_anchor = MLAnchor(origin_lat=cfg.origin_lat, origin_lon=cfg.origin_lon)
-    lon_f, lat_f = flights_anchor.local_to_geo(500.0, 300.0)
-    lon_m, lat_m = ml_anchor.local_to_geo(500.0, 300.0)
-    assert abs(lon_f - lon_m) < 1e-9
-    assert abs(lat_f - lat_m) < 1e-9
+def test_canonical_anchor_sits_over_europe():
+    # The default box anchor should place (x=0, y=0) at south-west Europe.
+    lon, lat = EUROPEAN_ANCHOR.local_to_geo(0.0, 0.0)
+    assert abs(lon - (-5.0)) < 1e-9
+    assert abs(lat - 43.0) < 1e-9

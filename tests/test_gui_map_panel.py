@@ -26,7 +26,18 @@ pytest.importorskip("plotly")
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from contrail_env import build_random_flights, default_european_world  # noqa: E402
-from gui.app import MainWindow, RouteLine, _geo_assets_script, build_map_figure  # noqa: E402
+from gui.app import (  # noqa: E402
+    _MAP_ANIM_FRAMES,
+    MainWindow,
+    RouteLine,
+    _geo_assets_script,
+    build_map_figure,
+)
+
+
+def _route(name, lon, lat, t_s, chosen):
+    return RouteLine(name, np.asarray(lon, float), np.asarray(lat, float),
+                     np.asarray(t_s, float), chosen)
 
 
 @pytest.fixture(scope="module")
@@ -40,32 +51,54 @@ def qapp():
 # Pure figure builder — no Qt, no web view.                                    #
 # --------------------------------------------------------------------------- #
 
-def test_build_map_figure_has_risk_and_route_traces():
+def test_build_map_figure_animates_routes_with_frames():
     lon, lat = np.meshgrid(np.linspace(-2, 18, 20), np.linspace(43, 50, 15), indexing="ij")
     risk = np.abs(np.sin(lon) * np.cos(lat))
+    t = np.array([0.0, 400.0, 800.0, 1200.0])
     routes = [
-        RouteLine("AB123", np.array([0.0, 5.0, 10.0]), np.array([45.0, 46.0, 47.0]), chosen=True),
-        RouteLine("CD456", np.array([1.0, 6.0]), np.array([44.0, 48.0]), chosen=False),
+        _route("AB123", [0, 5, 8, 10], [45, 46, 46.5, 47], t, chosen=True),
+        _route("CD456", [1, 3, 5, 6], [44, 45, 47, 48], t, chosen=False),
     ]
     fig = build_map_figure(source="synthetic", lon=lon, lat=lat, risk=risk, routes=routes)
 
-    # SVG `geo` traces (no WebGL): one marker overlay for risk + one line per route.
-    assert all(t.type == "scattergeo" for t in fig.data)
-    modes = [t.mode for t in fig.data]
-    assert modes.count("markers") == 1   # the ISSR risk overlay
-    assert modes.count("lines") == 2     # one trace per route
-    # The figure must serialise to a self-contained page (this is what the
-    # web view loads); inlined plotly.js makes it well over the setHtml limit.
+    # SVG `geo` traces (no WebGL). trace 0 = risk overlay; then per route a
+    # trail line + a head marker, so markers = risk + 2 heads, lines = 2 trails.
+    assert all(tr.type == "scattergeo" for tr in fig.data)
+    assert fig.data[0].mode == "markers"
+    modes = [tr.mode for tr in fig.data]
+    assert modes.count("lines") == 2
+    assert modes.count("markers") == 3
+    # Animation machinery: one frame per time step, a play/pause control + slider.
+    assert len(fig.frames) == _MAP_ANIM_FRAMES
+    assert fig.layout.updatemenus and fig.layout.sliders
+    # Frames update only the 2N route traces, never the risk overlay (trace 0).
+    assert list(fig.frames[0].traces) == [1, 2, 3, 4]
+    # Self-contained page (what the web view loads); inlined plotly.js is large.
     html = fig.to_html(include_plotlyjs="inline", full_html=True)
     assert "<html" in html.lower() and len(html) > 2_000_000
+
+
+def test_build_map_figure_static_when_not_animated():
+    lon, lat = np.meshgrid(np.linspace(-2, 18, 10), np.linspace(43, 50, 8), indexing="ij")
+    risk = np.abs(np.sin(lon))
+    t = np.array([0.0, 600.0, 1200.0])
+    routes = [_route("AB123", [0, 5, 10], [45, 46, 47], t, chosen=True)]
+    fig = build_map_figure(source="synthetic", lon=lon, lat=lat, risk=risk,
+                           routes=routes, animate=False)
+    # No frames; the route is drawn in full (one trail line + one head marker).
+    assert not fig.frames
+    modes = [tr.mode for tr in fig.data]
+    assert modes.count("lines") == 1
+    assert modes.count("markers") == 2  # risk overlay + head marker
 
 
 def test_build_map_figure_handles_empty_routes():
     lon, lat = np.meshgrid(np.linspace(0, 10, 8), np.linspace(44, 49, 6), indexing="ij")
     fig = build_map_figure(source="synthetic", lon=lon, lat=lat,
                            risk=np.zeros_like(lon), routes=[])
-    # Only the (empty, all-clear-sky) risk overlay; no routes.
+    # Only the (empty, all-clear-sky) risk overlay; no routes, no frames.
     assert [t.mode for t in fig.data] == ["markers"]
+    assert not fig.frames
 
 
 def test_geo_basemap_is_bundled_offline():
@@ -98,33 +131,17 @@ def test_render_map_synthetic_writes_html(qapp):
     assert os.path.getsize(win._map_html_path) > 2_000_000
 
 
-def test_render_map_ml_writes_html(qapp):
-    # The ML field needs the [ml] extra (scipy interpolation + the model).
-    pytest.importorskip("scipy")
-    pytest.importorskip("sklearn")
-    import warnings
+def test_render_map_uses_canonical_anchor(qapp):
+    # The synthetic field carries no anchor of its own, so the map falls back to
+    # the canonical European anchor.
+    from contrail_env.geo import EUROPEAN_ANCHOR
 
-    from contrail_ml.config import MLConfig
-    from contrail_ml.issr_field import MLIssrField
-
-    cfg = MLConfig()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        world = default_european_world(
-            seed=1,
-            issr_source="ml",
-            issr_kwargs=dict(config=cfg, met_source="synthetic",
-                             allow_synthetic=True, grid_res_deg=3.0, seed=1),
-        )
-    assert isinstance(world.issr, MLIssrField)
+    world = default_european_world(seed=1)
     flights = build_random_flights(n_flights=2, world=world, seed=1,
                                    corridor_frac=0.05, snapshot_window_s=(0.0, 300.0))
-
     win = MainWindow()
     win._world = world
     win._flights = flights
-    # Renders the ML risk field + routes without raising; the active anchor
-    # comes from the field itself (MLIssrField.anchor), not the synthetic default.
     win._render_map(None)
-    assert win._active_anchor(world.issr) is world.issr.anchor
+    assert win._active_anchor(world.issr) is EUROPEAN_ANCHOR
     assert os.path.exists(win._map_html_path)

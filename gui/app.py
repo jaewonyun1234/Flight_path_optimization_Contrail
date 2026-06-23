@@ -86,6 +86,7 @@ except ImportError:  # pragma: no cover - exercised only without the extra
 
 from contrail_env import assemble_qubo, fl_to_m, waypoints_for
 from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
+from contrail_env.geo import EUROPEAN_ANCHOR
 from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
 from service.client import DEFAULT_SERVER_ADDRESS, SolverClient
 from service.generated import solver_pb2
@@ -110,6 +111,11 @@ _MAP_SLICE_FL = 360
 _MAP_GRID_NX, _MAP_GRID_NY = 100, 68
 _MAP_MARKER_SIZE = 9
 _MAP_RISK_FLOOR_FRAC = 0.04
+# Animation: number of frames swept across the planning window, and the
+# per-frame dwell (ms) when playing. The route "reveals" (its trail grows) and
+# the aircraft marker glides along it as the time cursor advances.
+_MAP_ANIM_FRAMES = 48
+_MAP_FRAME_MS = 90
 # Bundled Natural Earth vectors for the geo basemap (see _geo_assets_script).
 _GEO_TOPOJSON_NAME = "world_50m"
 _GEO_ASSET_PATH = Path(__file__).resolve().parent / "assets" / f"{_GEO_TOPOJSON_NAME}.json"
@@ -141,6 +147,24 @@ def _geo_assets_script() -> str:
     )
 
 
+def _autoplay_script() -> str:
+    """Auto-run the route-reveal animation once the plot is live.
+
+    Plotly doesn't autoplay frames, so we poll for the graph div + library and
+    then kick off Plotly.animate from the first frame. Because _render_map
+    rewrites this page on every solve, the reveal replays each time a solution
+    lands. No-op for a static (frame-less) figure.
+    """
+    return (
+        "<script>(function(){function go(){"
+        "var gd=document.querySelector('.plotly-graph-div');"
+        "if(gd&&window.Plotly&&gd._fullLayout&&gd.frames&&gd.frames.length){"
+        f"Plotly.animate(gd,null,{{frame:{{duration:{_MAP_FRAME_MS},redraw:true}},"
+        "transition:{duration:0},fromcurrent:false,mode:'immediate'});}"
+        "else{setTimeout(go,120);}}setTimeout(go,200);})();</script>"
+    )
+
+
 def _mean_best_cost(instances, solver: str) -> str:
     """Mean best cost of one solver across the benchmark instances."""
     costs = [
@@ -158,12 +182,65 @@ def _mean_best_cost(instances, solver: str) -> str:
 
 @dataclass(frozen=True)
 class RouteLine:
-    """One flight's ground track in geographic coordinates for the map."""
+    """One flight's ground track in geographic coordinates for the map.
+
+    `t_s` is the world time (s) at each vertex; it drives the animation (the
+    trail reveals for vertices with t <= cursor, the aircraft marker rides the
+    interpolated position at the cursor).
+    """
 
     name: str
     lon: np.ndarray
     lat: np.ndarray
+    t_s: np.ndarray
     chosen: bool
+
+
+def _route_state_at(r: RouteLine, t_cursor: float):
+    """A route's revealed trail + aircraft-head position at time `t_cursor`.
+
+    The trail is every vertex flown so far (t <= cursor) plus the interpolated
+    current point, so the line ends exactly under the moving marker. np.interp
+    clamps outside the flight window, so before departure the head sits at the
+    origin and after arrival at the destination.
+    """
+    t = np.asarray(r.t_s, dtype=float)
+    lon = np.asarray(r.lon, dtype=float)
+    lat = np.asarray(r.lat, dtype=float)
+    h_lon = float(np.interp(t_cursor, t, lon))
+    h_lat = float(np.interp(t_cursor, t, lat))
+    flown = t <= t_cursor
+    trail_lon = np.append(lon[flown], h_lon)
+    trail_lat = np.append(lat[flown], h_lat)
+    return trail_lon, trail_lat, h_lon, h_lat
+
+
+def _trail_trace(go, r: RouteLine, trail_lon, trail_lat):
+    """The growing ground-track line (bright green + thick if chosen)."""
+    return go.Scattergeo(
+        lon=trail_lon, lat=trail_lat, mode="lines",
+        line=dict(
+            width=4 if r.chosen else 1.4,
+            color="#28dc5a" if r.chosen else "rgba(170,172,184,0.5)",
+        ),
+        name=f"{r.name} (chosen)" if r.chosen else r.name,
+        hovertemplate=f"{r.name}<extra></extra>",
+    )
+
+
+def _head_trace(go, r: RouteLine, h_lon, h_lat):
+    """The aircraft marker riding the front of the trail."""
+    return go.Scattergeo(
+        lon=[h_lon], lat=[h_lat], mode="markers",
+        marker=dict(
+            size=14 if r.chosen else 8,
+            symbol="triangle-up",
+            color="#39ff7a" if r.chosen else "rgba(210,212,224,0.85)",
+            line=dict(width=1.2 if r.chosen else 0.6, color="#0e0e10"),
+        ),
+        name=r.name, showlegend=False,
+        hovertemplate=f"{r.name}<extra></extra>",
+    )
 
 
 def build_map_figure(
@@ -173,17 +250,25 @@ def build_map_figure(
     lat: np.ndarray,
     risk: np.ndarray,
     routes: list[RouteLine],
+    animate: bool = True,
 ):
-    """Build the geographic Map figure: ISSR risk overlay + flight routes.
+    """Build the geographic Map figure: ISSR risk overlay + animated flight routes.
 
     Pure function of plain arrays so it carries no Qt/web dependency and can be
     unit-tested directly. `lon`/`lat`/`risk` are the (same-shape) sampled risk
-    field; `routes` are per-flight ground tracks already in lon/lat.
+    field; `routes` are per-flight ground tracks in lon/lat with per-vertex
+    times (`RouteLine.t_s`).
+
+    When `animate` and the routes span a time window, the figure carries Plotly
+    `frames` (one per time step) plus a play/pause control and a slider: each
+    route's trail grows and an aircraft marker glides along it as the cursor
+    sweeps the planning window. The risk overlay is static (trace 0); each route
+    contributes a trail trace then a head trace, so frames update indices 1..2N
+    and leave the overlay untouched.
 
     Rendered on Plotly's `geo` subplot (SVG / Natural Earth vectors) rather than
     a WebGL tile map, so it draws real country borders + coastlines and displays
-    even where WebGL is blocked (locked-down / headless Chromium). Returns a
-    Plotly Figure framed on the data's bounding box.
+    even where WebGL is blocked (locked-down / headless Chromium).
     """
     import plotly.graph_objects as go  # lazy: keep module import lean
 
@@ -193,23 +278,26 @@ def build_map_figure(
 
     fig = go.Figure()
 
-    # ISSR risk as an Inferno marker cloud over the basemap. `geo` has no native
-    # density trace, so we draw the grid samples as markers and skip near-zero
-    # "clear sky" cells, keeping the map readable where there's no risk.
+    # --- trace 0: ISSR risk as a graded marker cloud over the basemap. `geo`
+    # has no native density trace, so we draw the grid samples as markers, skip
+    # near-zero "clear sky" cells, and scale each marker by its risk so hotter
+    # air reads as bigger + brighter (a softer, denser look than flat dots).
     rmax = float(np.nanmax(risk_f)) if risk_f.size else 0.0
     keep = risk_f > (_MAP_RISK_FLOOR_FRAC * rmax) if rmax > 0 else np.zeros_like(risk_f, bool)
+    kr = risk_f[keep]
+    sizes = _MAP_MARKER_SIZE * (0.45 + 1.1 * (kr / rmax)) if rmax > 0 else _MAP_MARKER_SIZE
     fig.add_trace(
         go.Scattergeo(
             lon=lon_f[keep],
             lat=lat_f[keep],
             mode="markers",
             marker=dict(
-                size=_MAP_MARKER_SIZE,
-                color=risk_f[keep],
+                size=sizes,
+                color=kr,
                 colorscale="Inferno",
                 cmin=0.0,
                 cmax=rmax if rmax > 0 else 1.0,
-                opacity=0.55,
+                opacity=0.6,
                 line=dict(width=0),
                 colorbar=dict(title="ISSR<br>risk", thickness=12, len=0.6, x=0.99),
             ),
@@ -218,20 +306,68 @@ def build_map_figure(
         )
     )
 
-    # Routes: muted gray for context/baseline, bright green for the chosen plan.
+    # Decide whether to animate: need routes with a non-degenerate time span.
+    times = None
+    if animate and routes:
+        t0 = min(float(np.asarray(r.t_s, dtype=float)[0]) for r in routes)
+        t1 = max(float(np.asarray(r.t_s, dtype=float)[-1]) for r in routes)
+        if t1 > t0:
+            times = np.linspace(t0, t1, _MAP_ANIM_FRAMES)
+
+    # --- traces 1..2N: per route, a trail line then a head marker. The base
+    # figure shows the first frame (t0) when animating, else the full route.
     for r in routes:
-        fig.add_trace(
-            go.Scattergeo(
-                lon=np.asarray(r.lon, dtype=float),
-                lat=np.asarray(r.lat, dtype=float),
-                mode="lines",
-                line=dict(
-                    width=3 if r.chosen else 1.5,
-                    color="#28dc5a" if r.chosen else "rgba(200,200,210,0.6)",
-                ),
-                name=f"{r.name} (chosen)" if r.chosen else r.name,
-                hovertemplate=f"{r.name}<extra></extra>",
-            )
+        if times is not None:
+            tl_lon, tl_lat, h_lon, h_lat = _route_state_at(r, float(times[0]))
+        else:
+            tl_lon = np.asarray(r.lon, dtype=float)
+            tl_lat = np.asarray(r.lat, dtype=float)
+            h_lon, h_lat = float(tl_lon[-1]), float(tl_lat[-1])
+        fig.add_trace(_trail_trace(go, r, tl_lon, tl_lat))
+        fig.add_trace(_head_trace(go, r, h_lon, h_lat))
+
+    # --- frames + play/pause + slider (features: route reveal AND time-step) ---
+    if times is not None:
+        anim_indices = list(range(1, 1 + 2 * len(routes)))
+        frames = []
+        for k, tc in enumerate(times):
+            data = []
+            for r in routes:
+                tl_lon, tl_lat, h_lon, h_lat = _route_state_at(r, float(tc))
+                data.append(_trail_trace(go, r, tl_lon, tl_lat))
+                data.append(_head_trace(go, r, h_lon, h_lat))
+            frames.append(go.Frame(name=str(k), data=data, traces=anim_indices))
+        fig.frames = frames
+
+        play = dict(
+            label="▶ Play", method="animate",
+            args=[None, dict(frame=dict(duration=_MAP_FRAME_MS, redraw=True),
+                             fromcurrent=True, transition=dict(duration=0),
+                             mode="immediate")],
+        )
+        pause = dict(
+            label="⏸ Pause", method="animate",
+            args=[[None], dict(frame=dict(duration=0, redraw=False),
+                               mode="immediate", transition=dict(duration=0))],
+        )
+        fig.update_layout(
+            updatemenus=[dict(
+                type="buttons", direction="left", showactive=False,
+                x=0.01, y=0.02, xanchor="left", yanchor="bottom",
+                bgcolor="rgba(20,20,24,0.6)", font=dict(color="#dddde2"),
+                buttons=[play, pause],
+            )],
+            sliders=[dict(
+                active=0, x=0.12, len=0.8, y=0.02, yanchor="bottom",
+                bgcolor="rgba(20,20,24,0.6)", font=dict(color="#bdbdc6", size=10),
+                currentvalue=dict(prefix="t = ", suffix=" min", font=dict(color="#dddde2")),
+                steps=[dict(
+                    method="animate", label=f"{tc / 60:.0f}",
+                    args=[[str(k)], dict(mode="immediate",
+                                         frame=dict(duration=0, redraw=True),
+                                         transition=dict(duration=0))],
+                ) for k, tc in enumerate(times)],
+            )],
         )
 
     # Frame the view on the data box with a small margin; dark land/ocean makes
@@ -703,18 +839,13 @@ class MainWindow(QMainWindow):
         return self.map_view
 
     def _active_anchor(self, field):
-        """The GeoAnchor placing this ISSR field on the map.
+        """The GeoAnchor placing the synthetic ISSR field on the map.
 
-        The MLIssrField carries its own anchor; the synthetic field has none,
-        so we place it with the SAME canonical anchor the model/features use,
-        so synthetic and ml render over the same European box.
+        The field carries no anchor of its own (geography only matters for the
+        map), so we place it with the canonical European anchor that matches the
+        default world geometry.
         """
-        anchor = getattr(field, "anchor", None)
-        if anchor is not None:
-            return anchor
-        from contrail_ml.config import DEFAULT_CONFIG
-
-        return DEFAULT_CONFIG.anchor
+        return getattr(field, "anchor", None) or EUROPEAN_ANCHOR
 
     def _map_routes(self, chosen_by_flight: dict[str, int] | None, anchor) -> list[RouteLine]:
         """Per-flight ground tracks in lon/lat (chosen profile, else baseline)."""
@@ -731,12 +862,14 @@ class MainWindow(QMainWindow):
             wps = waypoints_for(flight, profile)
             wx = np.array([w[0] for w in wps], dtype=float)
             wy = np.array([w[1] for w in wps], dtype=float)
+            wt = np.array([w[3] for w in wps], dtype=float)  # world time per vertex
             lon, lat = anchor.local_to_geo(wx, wy)
             routes.append(
                 RouteLine(
                     name=flight.name,
                     lon=np.asarray(lon, dtype=float),
                     lat=np.asarray(lat, dtype=float),
+                    t_s=wt,
                     chosen=is_chosen,
                 )
             )
@@ -745,8 +878,7 @@ class MainWindow(QMainWindow):
     def _render_map(self, chosen_by_flight: dict[str, int] | None) -> None:
         """Render the ISSR-risk overlay + flight routes onto the geographic map.
 
-        Works for BOTH the synthetic ISSRField and the MLIssrField, since they
-        share the rhi_excess_grid interface. On a 2-D map the altitude dimension
+        Uses the ISSRField's rhi_excess_grid interface. On a 2-D map the altitude dimension
         collapses, so each flight is one ground track; once solved, chosen routes
         are drawn green over the muted context. Builds a Plotly figure and loads
         its self-contained HTML into the embedded web view.
@@ -779,6 +911,8 @@ class MainWindow(QMainWindow):
         assets = _geo_assets_script()
         if assets:
             html = html.replace("</head>", assets + "</head>", 1)
+        # Auto-run the reveal once the plot is live (replays on every solve).
+        html = html.replace("</body>", _autoplay_script() + "</body>", 1)
         with open(self._map_html_path, "w", encoding="utf-8") as fh:
             fh.write(html)
         if self.map_view is not None:
