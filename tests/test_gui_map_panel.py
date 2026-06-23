@@ -27,17 +27,21 @@ from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from contrail_env import build_random_flights, default_european_world  # noqa: E402
 from gui.app import (  # noqa: E402
-    _MAP_ANIM_FRAMES,
     MainWindow,
+    ProfileSeries,
     RouteLine,
     _geo_assets_script,
     build_map_figure,
 )
 
 
-def _route(name, lon, lat, t_s, chosen):
-    return RouteLine(name, np.asarray(lon, float), np.asarray(lat, float),
-                     np.asarray(t_s, float), chosen)
+def _route(name, lon, lat, chosen):
+    return RouteLine(name, np.asarray(lon, float), np.asarray(lat, float), chosen)
+
+
+def _profile(name, s_km, fl, issr, color, chosen):
+    return ProfileSeries(name, np.asarray(s_km, float), np.asarray(fl, float),
+                         np.asarray(issr, bool), color, chosen)
 
 
 @pytest.fixture(scope="module")
@@ -51,53 +55,39 @@ def qapp():
 # Pure figure builder — no Qt, no web view.                                    #
 # --------------------------------------------------------------------------- #
 
-def test_build_map_figure_animates_routes_with_frames():
+def test_build_map_figure_has_profiles_and_inset_map():
     lon, lat = np.meshgrid(np.linspace(-2, 18, 20), np.linspace(43, 50, 15), indexing="ij")
     risk = np.abs(np.sin(lon) * np.cos(lat))
-    t = np.array([0.0, 400.0, 800.0, 1200.0])
-    routes = [
-        _route("AB123", [0, 5, 8, 10], [45, 46, 46.5, 47], t, chosen=True),
-        _route("CD456", [1, 3, 5, 6], [44, 45, 47, 48], t, chosen=False),
+    s = np.array([0.0, 100.0, 200.0, 300.0])
+    profiles = [
+        _profile("AB123", s, [360, 360, 380, 380], [False, True, False, False], "#4ea1ff", True),
+        _profile("AB123", s, [360, 360, 360, 360], [False, True, True, False], "#4ea1ff", False),
     ]
-    fig = build_map_figure(source="synthetic", lon=lon, lat=lat, risk=risk, routes=routes)
+    routes = [_route("AB123", [0, 5, 10], [45, 46, 47], chosen=True)]
+    fig = build_map_figure(source="synthetic", profiles=profiles,
+                           lon=lon, lat=lat, risk=risk, routes=routes)
 
-    # SVG `geo` traces (no WebGL). trace 0 = risk overlay; then per route a
-    # trail line + a head marker, so markers = risk + 2 heads, lines = 2 trails.
-    assert all(tr.type == "scattergeo" for tr in fig.data)
-    assert fig.data[0].mode == "markers"
-    modes = [tr.mode for tr in fig.data]
-    assert modes.count("lines") == 2
-    assert modes.count("markers") == 3
-    # Animation machinery: one frame per time step, a play/pause control + slider.
-    assert len(fig.frames) == _MAP_ANIM_FRAMES
-    assert fig.layout.updatemenus and fig.layout.sliders
-    # Frames update only the 2N route traces, never the risk overlay (trace 0).
-    assert list(fig.frames[0].traces) == [1, 2, 3, 4]
+    # Profiles are xy `scatter` traces; the inset risk + ground track are `scattergeo`.
+    types = [t.type for t in fig.data]
+    assert types.count("scatter") == 2        # two altitude-profile lines
+    assert types.count("scattergeo") == 2     # inset risk cloud + one ground track
+    # Static figure — no animation frames.
+    assert not fig.frames
+    # The geo inset is parked in the top-right corner.
+    assert fig.layout.geo.domain.x[0] > 0.5
+    assert fig.layout.geo.domain.y[1] > 0.9
     # Self-contained page (what the web view loads); inlined plotly.js is large.
     html = fig.to_html(include_plotlyjs="inline", full_html=True)
     assert "<html" in html.lower() and len(html) > 2_000_000
 
 
-def test_build_map_figure_static_when_not_animated():
-    lon, lat = np.meshgrid(np.linspace(-2, 18, 10), np.linspace(43, 50, 8), indexing="ij")
-    risk = np.abs(np.sin(lon))
-    t = np.array([0.0, 600.0, 1200.0])
-    routes = [_route("AB123", [0, 5, 10], [45, 46, 47], t, chosen=True)]
-    fig = build_map_figure(source="synthetic", lon=lon, lat=lat, risk=risk,
-                           routes=routes, animate=False)
-    # No frames; the route is drawn in full (one trail line + one head marker).
-    assert not fig.frames
-    modes = [tr.mode for tr in fig.data]
-    assert modes.count("lines") == 1
-    assert modes.count("markers") == 2  # risk overlay + head marker
-
-
-def test_build_map_figure_handles_empty_routes():
+def test_build_map_figure_handles_empty():
     lon, lat = np.meshgrid(np.linspace(0, 10, 8), np.linspace(44, 49, 6), indexing="ij")
-    fig = build_map_figure(source="synthetic", lon=lon, lat=lat,
+    fig = build_map_figure(source="synthetic", profiles=[], lon=lon, lat=lat,
                            risk=np.zeros_like(lon), routes=[])
-    # Only the (empty, all-clear-sky) risk overlay; no routes, no frames.
-    assert [t.mode for t in fig.data] == ["markers"]
+    # Only the (empty) inset risk overlay; no profiles, no routes, no frames.
+    assert [t.type for t in fig.data] == ["scattergeo"]
+    assert not fig.frames
     assert not fig.frames
 
 
