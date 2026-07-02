@@ -31,11 +31,13 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 
 from .classical_baselines import solve_random_repair, solve_simulated_annealing
 from .flight import EvaluatedOption
+from .metrics import success_probability, time_to_solution
 from .options import build_and_evaluate_flight, build_random_flights
 from .pasqal_analog import solve_pasqal_analog
 from .quantum_common import BackendBudgetError, QuantumResult
@@ -80,11 +82,17 @@ class SolverRun:
     n_samples: int = 0
     history: list[tuple[int, float]] = field(default_factory=list)
     note: str = ""
+    # Per-shot statistics (§S2). success_prob = fraction of repaired shots that
+    # hit E*_exact; tts_sample_s uses only the sampling wall clock; tts_total_s
+    # amortizes the full pipeline (the gap is the BO / tuning overhead).
+    success_prob: float = math.nan
+    tts_sample_s: float = math.nan
+    tts_total_s: float = math.nan
 
 
 @dataclass
 class InstanceResult:
-    """All three solver runs on one seeded instance."""
+    """All solver runs on one seeded instance."""
 
     seed: int
     optimum: float
@@ -92,6 +100,10 @@ class InstanceResult:
     n_conflicts: int
     n_buckets: int
     runs: list[SolverRun] = field(default_factory=list)
+    # Exact optimum (sum of c_i over the CP-SAT choice), NOT the cent-quantized
+    # objective — this is the success threshold for p_s (§S2). math.nan until
+    # CP-SAT has solved.
+    optimum_exact: float = math.nan
 
     def run_for(self, solver: str) -> SolverRun | None:
         for run in self.runs:
@@ -111,6 +123,12 @@ class SolverStats:
     ratio_ci_high: float
     feasibility_mean: float
     wall_clock_mean_s: float
+    # §S2 aggregates. TTS is heavy-tailed (a single p_s = 0 seed makes it
+    # infinite), so it is summarized with the median + IQR across seeds, never
+    # a bootstrap mean. tts_* use the sampling-only TTS (tts_sample_s).
+    success_mean: float = math.nan
+    tts_median_s: float = math.nan
+    tts_iqr_s: float = math.nan
 
 
 @dataclass
@@ -126,15 +144,22 @@ class BenchmarkReport:
             ratios: list[float] = []
             feas: list[float] = []
             walls: list[float] = []
+            succ: list[float] = []
+            tts: list[float] = []
             for inst in self.instances:
                 run = inst.run_for(solver)
                 if run is not None and run.status == "OK":
                     ratios.append(run.approx_ratio)
                     feas.append(run.feasibility_rate)
                     walls.append(run.wall_clock_s)
+                    if not math.isnan(run.success_prob):
+                        succ.append(run.success_prob)
+                    if not math.isnan(run.tts_sample_s):
+                        tts.append(run.tts_sample_s)
             if not ratios:
                 continue
             lo, hi = bootstrap_ci(ratios, rng=np.random.default_rng(rng_seed))
+            tts_median, tts_iqr = _tts_median_iqr(tts)
             stats[solver] = SolverStats(
                 solver=solver,
                 n_ok=len(ratios),
@@ -143,6 +168,9 @@ class BenchmarkReport:
                 ratio_ci_high=hi,
                 feasibility_mean=float(np.mean(feas)),
                 wall_clock_mean_s=float(np.mean(walls)),
+                success_mean=float(np.mean(succ)) if succ else math.nan,
+                tts_median_s=tts_median,
+                tts_iqr_s=tts_iqr,
             )
         return stats
 
@@ -150,13 +178,15 @@ class BenchmarkReport:
         """Plain-text summary table (one row per solver)."""
         lines = [
             f"{'solver':<14} {'n':>3} {'ratio':>7} {'95% CI':>17} "
-            f"{'feas%':>7} {'wall':>9}",
+            f"{'feas%':>7} {'succ%':>7} {'medTTS':>9} {'wall':>9}",
         ]
         for s in self.aggregate().values():
+            succ = "—" if math.isnan(s.success_mean) else f"{100 * s.success_mean:.1f}"
             lines.append(
                 f"{s.solver:<14} {s.n_ok:>3} {s.ratio_mean:>7.4f} "
                 f"[{s.ratio_ci_low:.4f}, {s.ratio_ci_high:.4f}] "
-                f"{100 * s.feasibility_mean:>6.1f} {1000 * s.wall_clock_mean_s:>7.0f}ms"
+                f"{100 * s.feasibility_mean:>6.1f} {succ:>7} "
+                f"{_fmt_tts(s.tts_median_s):>9} {1000 * s.wall_clock_mean_s:>7.0f}ms"
             )
         return "\n".join(lines)
 
@@ -165,19 +195,47 @@ class BenchmarkReport:
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "seed", "solver", "backend", "status", "optimum", "best_cost",
-                "approx_ratio", "feasibility_rate", "wall_clock_s",
+                "seed", "solver", "backend", "status", "optimum", "optimum_exact",
+                "best_cost", "approx_ratio", "feasibility_rate",
+                "success_prob", "tts_sample_s", "tts_total_s", "wall_clock_s",
                 "n_samples", "n_options", "n_conflicts", "note",
             ])
             for inst in self.instances:
                 for run in inst.runs:
                     writer.writerow([
                         inst.seed, run.solver, run.backend, run.status,
-                        f"{inst.optimum:.2f}", f"{run.best_cost:.2f}",
+                        f"{inst.optimum:.2f}", f"{inst.optimum_exact:.6f}",
+                        f"{run.best_cost:.2f}",
                         f"{run.approx_ratio:.6f}", f"{run.feasibility_rate:.4f}",
+                        f"{run.success_prob:.6f}", f"{run.tts_sample_s:.6g}",
+                        f"{run.tts_total_s:.6g}",
                         f"{run.wall_clock_s:.4f}", run.n_samples,
                         inst.n_options, inst.n_conflicts, run.note,
                     ])
+
+
+def _fmt_tts(tts_s: float) -> str:
+    """Render a TTS for the text table: '∞' for infinite, else seconds."""
+    if math.isnan(tts_s):
+        return "—"
+    if math.isinf(tts_s):
+        return "∞"
+    return f"{tts_s:.3g}s"
+
+
+def _tts_median_iqr(values: Sequence[float]) -> tuple[float, float]:
+    """Median + inter-quartile range of a heavy-tailed TTS sample.
+
+    inf values (p_s = 0 seeds) are kept: numpy's median/percentile propagate
+    them faithfully, so a solver that fails on most seeds gets an infinite
+    median — which is the honest summary, not a silently dropped tail.
+    """
+    if not values:
+        return math.nan, math.nan
+    arr = np.asarray(values, dtype=float)
+    median = float(np.median(arr))
+    q25, q75 = np.percentile(arr, [25, 75])
+    return median, float(q75 - q25)
 
 
 def bootstrap_ci(
@@ -201,8 +259,20 @@ def bootstrap_ci(
 # THE PROTOCOL
 # =============================================================================
 
-def _quantum_to_run(result: QuantumResult, optimum: float, wall_clock_s: float) -> SolverRun:
-    """Convert a QuantumResult into a benchmark cell."""
+def _quantum_to_run(
+    result: QuantumResult, optimum: float, optimum_exact: float, wall_clock_s: float
+) -> SolverRun:
+    """Convert a QuantumResult into a benchmark cell, with §S2 per-shot stats."""
+    # p_s and both TTS variants (sampling-only vs full-pipeline amortized).
+    success = math.nan
+    tts_sample = math.nan
+    tts_total = math.nan
+    if result.evaluation is not None and not math.isnan(optimum_exact):
+        success = success_probability(result.evaluation, optimum_exact)
+        n = max(1, result.n_samples)
+        t_sample_wall = cast(float, result.meta.get("final_sampling_wall_clock_s", wall_clock_s))
+        tts_sample = time_to_solution(float(t_sample_wall) / n, success)
+        tts_total = time_to_solution(wall_clock_s / n, success)
     return SolverRun(
         solver=result.solver,
         backend=result.backend,
@@ -213,6 +283,9 @@ def _quantum_to_run(result: QuantumResult, optimum: float, wall_clock_s: float) 
         wall_clock_s=wall_clock_s,
         n_samples=result.n_samples,
         history=list(result.history),
+        success_prob=success,
+        tts_sample_s=tts_sample,
+        tts_total_s=tts_total,
     )
 
 
@@ -268,6 +341,11 @@ def _run_instance(
         on_progress=cpsat_progress,
     )
     instance.optimum = cpsat.objective
+    # Exact optimum on the same float path as repaired sample costs (NOT the
+    # cent-quantized objective) — this is the success threshold for p_s (§S2).
+    instance.optimum_exact = float(
+        sum(evals[i].cost_combined for i in cpsat.chosen_eval_indices)
+    )
     emit(SolverRun(
         solver="cpsat",
         backend="ortools",
@@ -302,7 +380,9 @@ def _run_instance(
                 evals, conflicts, buckets,
                 n_samples=n_shots, seed=seed, on_progress=baseline_progress,
             )
-            emit(_quantum_to_run(result, instance.optimum, time.perf_counter() - t0))
+            emit(_quantum_to_run(
+                result, instance.optimum, instance.optimum_exact, time.perf_counter() - t0,
+            ))
         except Exception as exc:  # samplers have no budget cap, but stay defensive
             emit(SolverRun(solver=name, backend="-", status="FAILED", note=str(exc)))
 
@@ -329,7 +409,9 @@ def _run_instance(
                 backend=pasqal_backend, on_progress=pasqal_progress,
                 on_phase=pasqal_phase,
             )
-            emit(_quantum_to_run(pasqal, instance.optimum, time.perf_counter() - t0))
+            emit(_quantum_to_run(
+                pasqal, instance.optimum, instance.optimum_exact, time.perf_counter() - t0,
+            ))
         except BackendBudgetError as exc:
             emit(SolverRun(solver="pasqal-analog", backend="-", status="SKIPPED", note=str(exc)))
         except Exception as exc:  # surface, don't kill the sweep
@@ -353,7 +435,9 @@ def _run_instance(
                 n_samples=n_shots, seed=seed,
                 backend=xanadu_backend, on_progress=xanadu_progress,
             )
-            emit(_quantum_to_run(xanadu, instance.optimum, time.perf_counter() - t0))
+            emit(_quantum_to_run(
+                xanadu, instance.optimum, instance.optimum_exact, time.perf_counter() - t0,
+            ))
         except BackendBudgetError as exc:
             emit(SolverRun(solver="xanadu-gbs", backend="-", status="SKIPPED", note=str(exc)))
         except Exception as exc:

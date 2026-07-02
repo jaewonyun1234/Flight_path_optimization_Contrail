@@ -126,6 +126,9 @@ from .classical_baselines import (
     solve_random_repair, solve_simulated_annealing,
 )
 
+# Per-shot benchmark statistics (success probability + time-to-solution)
+from .metrics import success_probability, time_to_solution
+
 # Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
 from .benchmark import (
     BenchmarkReport, InstanceResult, SolverRun, SolverStats,
@@ -178,6 +181,8 @@ __all__ = [
     "solve_xanadu_gbs", "strawberryfields_available",
     # Classical baselines
     "solve_random_repair", "solve_simulated_annealing",
+    # Per-shot metrics
+    "success_probability", "time_to_solution",
     # Benchmark
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",

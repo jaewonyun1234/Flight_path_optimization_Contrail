@@ -458,12 +458,18 @@ def solve_pasqal_analog(
         delta_init=float(bo.x_best[2]),
         delta_final=float(bo.x_best[3]),
     )
+    # Time ONLY the final high-statistics evolution + sampling: this is the
+    # per-shot cost t_shot the TTS metric needs. The BO loop above is tuning
+    # overhead, reported separately (the gap between tts_sample and tts_total
+    # in the benchmark IS the BO cost).
+    t_sample0 = time.perf_counter()
     if use_pulser:
         final_samples = _pulser_sample(graph, best_schedule, shots=n_shots)
     else:
         assert sim is not None
         probs = evolve(best_schedule, "final sampling at the best schedule", bo_iters)
         final_samples = _sample_bits(probs, graph.n, n_shots, rng)
+    final_sampling_wall_clock_s = time.perf_counter() - t_sample0
 
     evaluation = evaluate_samples(graph, final_samples)
     if evaluation.best_cost > best_cost:
@@ -489,5 +495,6 @@ def solve_pasqal_analog(
             "n_qubits": graph.n,
             "bo_iters": bo_iters,
             "mean_penalized_energy": round(bo.y_best, 2),
+            "final_sampling_wall_clock_s": final_sampling_wall_clock_s,
         },
     )

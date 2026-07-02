@@ -231,6 +231,11 @@ class SampleEvaluation:
     feasibility_rate: float
     best_raw_cost: float | None
     n_samples: int
+    # Per-shot repaired outcomes for success-probability / TTS statistics
+    # (§S2): (repaired assignment as sorted eval indices, repaired cost,
+    # multiplicity). Multiplicities sum to n_samples. Populated for free from
+    # the dedup counts already computed in evaluate_samples.
+    repaired_unique: list[tuple[tuple[int, ...], float, int]] = field(default_factory=list)
 
 
 def evaluate_samples(
@@ -252,6 +257,7 @@ def evaluate_samples(
     best_indices: list[int] = []
     best_raw: float | None = None
     n_feasible_raw = 0
+    repaired_unique: list[tuple[tuple[int, ...], float, int]] = []
 
     for bits, count in unique.values():
         if sample_is_feasible(graph, bits):
@@ -261,6 +267,7 @@ def evaluate_samples(
                 best_raw = raw_cost
         indices = repair_sample(graph, bits)
         cost = float(sum(graph.costs[i] for i in indices))
+        repaired_unique.append((tuple(indices), cost, count))
         if cost < best_cost:
             best_cost = cost
             best_indices = indices
@@ -271,6 +278,7 @@ def evaluate_samples(
         feasibility_rate=n_feasible_raw / n_total if n_total else 0.0,
         best_raw_cost=best_raw,
         n_samples=n_total,
+        repaired_unique=repaired_unique,
     )
 
 
@@ -308,6 +316,10 @@ class QuantumResult:
     wall_clock_s: float
     history: list[tuple[int, float]]
     meta: dict[str, object] = field(default_factory=dict)
+    # The final-batch SampleEvaluation, kept so downstream code (benchmark.py)
+    # can derive per-shot success probability / TTS without re-repairing. Plain
+    # data, safe to cross a Qt signal boundary.
+    evaluation: SampleEvaluation | None = None
 
 
 def make_result(
@@ -337,4 +349,5 @@ def make_result(
         wall_clock_s=wall_clock_s,
         history=history,
         meta=meta,
+        evaluation=evaluation,
     )
