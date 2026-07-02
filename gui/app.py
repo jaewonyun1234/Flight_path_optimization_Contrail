@@ -108,6 +108,20 @@ SOLVER_PENS: dict[str, str] = {
 # Pens for the entropy-cut curves (Dynamics tab) — order-stable, one per cut.
 _CUT_PENS = ["c", "y", "m", "w"]
 
+# Constraint-violation families (G3): the four pre-repair violation kinds, the
+# SolverRun attribute each reads, and one colour each for the grouped bar chart.
+_FP_FAMILIES = ["deficit", "excess", "conflict", "overflow"]
+_FP_FAMILY_ATTR = {
+    "deficit": "onehot_deficit_mean",
+    "excess": "onehot_excess_mean",
+    "conflict": "conflict_viol_mean",
+    "overflow": "capacity_overflow_mean",
+}
+_FP_FAMILY_COLORS = {
+    "deficit": "#e15759", "excess": "#4e79a7",
+    "conflict": "#f28e2b", "overflow": "#59a14f",
+}
+
 # §0.5 honesty sentence — entropy and the spectral gap locate the sweep's
 # critical window; they are not performance validation. Verbatim per spec.
 _DYN_HONESTY = (
@@ -606,6 +620,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_benchmark_tab(), "7 · Quantum benchmark")
         self.tabs.addTab(self._build_map_tab(), "8 · Map")
         self.tabs.addTab(self._build_dynamics_tab(), "9 · Quantum dynamics")
+        self.tabs.addTab(self._build_fingerprint_tab(), "10 · Constraint fingerprint")
 
         root = QHBoxLayout()
         root.addWidget(left_widget)
@@ -1197,6 +1212,76 @@ class MainWindow(QMainWindow):
         root.addWidget(plots_w, stretch=1)
         root.addWidget(self.dyn_info)
         root.addWidget(self.dyn_status)
+        wrap = QWidget()
+        wrap.setLayout(root)
+        return wrap
+
+    # ------------------------------------------- tab 10: constraint fingerprint ---
+    def _build_fingerprint_tab(self) -> QWidget:
+        self.fp_export_csv_btn = QPushButton("Export CSV…")
+        self.fp_export_csv_btn.clicked.connect(self._on_export_fp_csv)
+        self.fp_export_csv_btn.setEnabled(False)
+        self.fp_export_png_btn = QPushButton("Export PNG…")
+        self.fp_export_png_btn.clicked.connect(self._on_export_fp_png)
+        self.fp_export_png_btn.setEnabled(False)
+
+        self.fp_plot = pg.PlotWidget(
+            title="Raw-sample constraint violations, per family (pre-repair)")
+        self.fp_plot.setLabel("left", "mean violations per raw sample")
+        self.fp_plot.showGrid(y=True, alpha=0.3)
+        # A static family colour key in the legend (one square per family).
+        self._fp_legend = self.fp_plot.addLegend()
+        for fam in _FP_FAMILIES:
+            proxy = pg.ScatterPlotItem(
+                [], [], symbol="s", size=12, brush=pg.mkBrush(_FP_FAMILY_COLORS[fam]), pen=None)
+            self.fp_plot.addItem(proxy)
+            self._fp_legend.addItem(proxy, fam)
+        self._fp_bar_item: pg.BarGraphItem | None = None
+
+        self.fp_repair_plot = pg.PlotWidget(
+            title="Repair distance per solver (how far repair moved each platform's samples)")
+        self.fp_repair_plot.setLabel("bottom", "mean Hamming distance to repaired")
+        self.fp_repair_plot.showGrid(x=True, alpha=0.3)
+        self._fp_repair_item: pg.BarGraphItem | None = None
+
+        self.fp_info = QLabel()
+        self.fp_info.setTextFormat(Qt.TextFormat.RichText)
+        self.fp_info.setWordWrap(True)
+        self.fp_info.setText(
+            '<b>families:</b> '
+            '<span style="color:#e15759">deficit</span> · '
+            '<span style="color:#4e79a7">excess</span> · '
+            '<span style="color:#f28e2b">conflict</span> · '
+            '<span style="color:#59a14f">overflow</span> &nbsp;—&nbsp; '
+            "blockade → deficit-dominant expected on Pasqal; hafnian "
+            "density-weighting → excess/overflow-dominant expected on GBS — "
+            "the chart tests this.")
+
+        self.fp_status = QLabel(
+            "run a benchmark (tab 7) first; this tab decomposes each solver's "
+            "raw-sample constraint violations.")
+        self.fp_status.setFont(_MONO)
+        self.fp_status.setWordWrap(True)
+
+        # Aggregated rows kept for CSV export: (solver, family, mean).
+        self._fp_rows: list[tuple[str, str, float]] = []
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        controls.addWidget(self.fp_export_csv_btn)
+        controls.addWidget(self.fp_export_png_btn)
+
+        plots = QHBoxLayout()
+        plots.addWidget(self.fp_plot, stretch=3)
+        plots.addWidget(self.fp_repair_plot, stretch=1)
+        plots_w = QWidget()
+        plots_w.setLayout(plots)
+
+        root = QVBoxLayout()
+        root.addLayout(controls)
+        root.addWidget(plots_w, stretch=1)
+        root.addWidget(self.fp_info)
+        root.addWidget(self.fp_status)
         wrap = QWidget()
         wrap.setLayout(root)
         return wrap
@@ -1940,8 +2025,80 @@ class MainWindow(QMainWindow):
     def _on_export_dynamics_png(self) -> None:
         _export_plot_png(self, self.dyn_glw)
 
+    # -------------------------------------------- tab 10: constraint fingerprint ---
     def _refresh_fingerprint_tab(self) -> None:
-        """Populated by the constraint-fingerprint tab (G3); no-op until then."""
+        """Render the S5 fingerprint decomposition from the last benchmark (G3).
+
+        No computation of its own — it aggregates the per-instance SolverRun
+        fingerprint means the benchmark already produced. Solvers without raw
+        samples (CP-SAT) carry NaN means and are dropped automatically.
+        """
+        report = self._bench_report
+        if report is None:
+            return
+
+        agg: dict[str, dict[str, float]] = {}
+        for name in SOLVER_NAMES:
+            per_family: dict[str, list[float]] = {f: [] for f in _FP_FAMILIES}
+            repairs: list[float] = []
+            for inst in report.instances:
+                run = inst.run_for(name)
+                if run is None or run.status != "OK" or math.isnan(run.onehot_deficit_mean):
+                    continue
+                for fam in _FP_FAMILIES:
+                    per_family[fam].append(float(getattr(run, _FP_FAMILY_ATTR[fam])))
+                repairs.append(float(run.repair_dist_mean))
+            if repairs:
+                agg[name] = {f: float(np.mean(per_family[f])) for f in _FP_FAMILIES}
+                agg[name]["repair"] = float(np.mean(repairs))
+
+        solvers = list(agg.keys())
+        if self._fp_bar_item is not None:
+            self.fp_plot.removeItem(self._fp_bar_item)
+        if self._fp_repair_item is not None:
+            self.fp_repair_plot.removeItem(self._fp_repair_item)
+
+        # Grouped bars: one BarGraphItem, four coloured bars per solver.
+        bar_w = 0.18
+        xs: list[float] = []
+        heights: list[float] = []
+        brushes: list[object] = []
+        for i, name in enumerate(solvers):
+            for j, fam in enumerate(_FP_FAMILIES):
+                xs.append(i + (j - 1.5) * bar_w)
+                heights.append(agg[name][fam])
+                brushes.append(pg.mkBrush(_FP_FAMILY_COLORS[fam]))
+        self._fp_bar_item = pg.BarGraphItem(x=xs, height=heights, width=bar_w, brushes=brushes)
+        self.fp_plot.addItem(self._fp_bar_item)
+        bottom_axis = self.fp_plot.getAxis("bottom")
+        bottom_axis.setTicks([[(i, name) for i, name in enumerate(solvers)]])
+
+        # Side: repair distance as horizontal bars, one SOLVER_PENS colour each.
+        ys = list(range(len(solvers)))
+        self._fp_repair_item = pg.BarGraphItem(
+            x0=[0.0] * len(solvers), x1=[agg[s]["repair"] for s in solvers],
+            y=ys, height=0.5,
+            brushes=[pg.mkBrush(SOLVER_PENS[s]) for s in solvers],
+        )
+        self.fp_repair_plot.addItem(self._fp_repair_item)
+        self.fp_repair_plot.getAxis("left").setTicks(
+            [[(i, name) for i, name in enumerate(solvers)]])
+
+        self._fp_rows = [(s, fam, agg[s][fam]) for s in solvers for fam in _FP_FAMILIES]
+        self.fp_export_csv_btn.setEnabled(bool(self._fp_rows))
+        self.fp_export_png_btn.setEnabled(bool(self._fp_rows))
+        self.fp_status.setText(
+            f"decomposed {len(solvers)} solver(s) over {len(report.instances)} "
+            f"instance(s); bars are means per raw pre-repair sample.")
+
+    def _on_export_fp_csv(self) -> None:
+        if not self._fp_rows:
+            return
+        rows: list[list[object]] = [[s, fam, mean] for s, fam, mean in self._fp_rows]
+        _export_rows_csv(self, ["solver", "family", "mean"], rows)
+
+    def _on_export_fp_png(self) -> None:
+        _export_plot_png(self, self.fp_plot)
 
     def _on_bench_failed(self, message: str) -> None:
         self._bench_timer.stop()
