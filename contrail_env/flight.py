@@ -242,8 +242,6 @@ def build_baseline_profile(
             ))
             current_fl += 20      # step climb 2000 ft
             seg_start = t
-            # Climb takes a couple of minutes; we skip ahead so the next
-            # iteration doesn't immediately try to climb again.
             _extra_fuel, climb_time = perf.climb_cost(mass, current_fl-20, current_fl)
             t += climb_time
             continue
