@@ -134,6 +134,12 @@ from .spectral import (
     AnalogSpectrum, hamiltonian_matvec, instantaneous_spectrum, lowest_eigenpairs,
 )
 
+# Time-resolved dynamics diagnostics (entropy, ground population, residual energy)
+from .dynamics import (
+    DynamicsRecord, ResidualEnergyResult,
+    bipartite_entropy, default_cuts, residual_energy_vs_T, run_with_diagnostics,
+)
+
 # Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
 from .benchmark import (
     BenchmarkReport, InstanceResult, SolverRun, SolverStats,
@@ -190,6 +196,9 @@ __all__ = [
     "success_probability", "time_to_solution",
     # Spectral diagnostics
     "AnalogSpectrum", "hamiltonian_matvec", "instantaneous_spectrum", "lowest_eigenpairs",
+    # Dynamics diagnostics
+    "DynamicsRecord", "ResidualEnergyResult",
+    "bipartite_entropy", "default_cuts", "residual_energy_vs_T", "run_with_diagnostics",
     # Benchmark
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",

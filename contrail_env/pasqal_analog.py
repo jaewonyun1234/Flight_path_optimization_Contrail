@@ -181,18 +181,33 @@ class RydbergStatevector:
         schedule: AnnealSchedule,
         n_steps: int = 500,
         on_step: Callable[[int, int], None] | None = None,
+        *,
+        observer: Callable[[int, np.ndarray], None] | None = None,
+        observe_stride: int = 0,
     ) -> np.ndarray:
         """Evolve |00...0> under H(t) and return the 2^n outcome probabilities.
 
         `on_step(steps_done, n_steps)` fires every ~5% of the integration —
         a liveness heartbeat for callers (one evolution at 19-20 qubits takes
         minutes, and without this there is no sign of life in between).
+
+        `observer(step, psi)` (§S4), when set, is ALWAYS called once with step=0
+        before the loop, and again after the SECOND half_phase multiply of step
+        k whenever observe_stride > 0 and (k+1) % observe_stride == 0.
+        observe_stride=0 (the default) skips only the periodic in-loop calls, so
+        a caller that only wants the initial state can leave it unset. `psi` is
+        the LIVE buffer: observers must not mutate it and must .copy() anything
+        they keep, since the next iteration overwrites it in place. `observer`
+        left as None (the default) must not change `probs` at all.
         """
         n = self.n
         dt = (schedule.T_ns / 1000.0) / n_steps  # us; energies are rad/us
         psi = np.zeros(1 << n, dtype=np.complex128)
         psi[0] = 1.0
         stride = max(1, n_steps // 20)
+
+        if observer is not None:
+            observer(0, psi)
 
         for k in range(n_steps):
             s = (k + 0.5) / n_steps
@@ -212,6 +227,8 @@ class RydbergStatevector:
             psi *= half_phase
             if on_step is not None and (k + 1) % stride == 0:
                 on_step(k + 1, n_steps)
+            if observer is not None and observe_stride > 0 and (k + 1) % observe_stride == 0:
+                observer(k + 1, psi)
 
         probs = np.abs(psi) ** 2
         return probs / probs.sum()
