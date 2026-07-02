@@ -17,6 +17,9 @@ keywords = ["optimization", "cp-sat", "contrails", "quantum", "pyqt6"]
 dependencies = [
     "numpy>=1.26",
     "ortools>=9.10",
+    # scipy.sparse.linalg.eigsh (Lanczos) powers the analog-sweep spectrum
+    # (spectral.py) and the time-resolved dynamics diagnostics (dynamics.py).
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
