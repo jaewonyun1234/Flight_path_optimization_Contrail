@@ -121,6 +121,30 @@ from .xanadu_gbs import (
     solve_xanadu_gbs, strawberryfields_available,
 )
 
+# Classical sampling baselines (null control + simulated annealing)
+from .classical_baselines import (
+    solve_random_repair, solve_simulated_annealing,
+)
+
+# Per-shot benchmark statistics (success probability + time-to-solution)
+from .metrics import success_probability, time_to_solution
+
+# Instantaneous spectrum of the analog sweep (adiabaticity diagnostic)
+from .spectral import (
+    AnalogSpectrum, hamiltonian_matvec, instantaneous_spectrum, lowest_eigenpairs,
+)
+
+# Time-resolved dynamics diagnostics (entropy, ground population, residual energy)
+from .dynamics import (
+    DynamicsRecord, ResidualEnergyResult,
+    bipartite_entropy, default_cuts, residual_energy_vs_T, run_with_diagnostics,
+)
+
+# Constraint-violation fingerprint (raw pre-repair sample decomposition)
+from .fingerprint import (
+    Fingerprint, ViolationStats, fingerprint_bitstrings, fingerprint_to_flat_dict,
+)
+
 # Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
 from .benchmark import (
     BenchmarkReport, InstanceResult, SolverRun, SolverStats,
@@ -171,6 +195,17 @@ __all__ = [
     "GBSEncoding", "GBSSubsetSampler",
     "encode_option_graph", "hafnian", "takagi_symmetric",
     "solve_xanadu_gbs", "strawberryfields_available",
+    # Classical baselines
+    "solve_random_repair", "solve_simulated_annealing",
+    # Per-shot metrics
+    "success_probability", "time_to_solution",
+    # Spectral diagnostics
+    "AnalogSpectrum", "hamiltonian_matvec", "instantaneous_spectrum", "lowest_eigenpairs",
+    # Dynamics diagnostics
+    "DynamicsRecord", "ResidualEnergyResult",
+    "bipartite_entropy", "default_cuts", "residual_energy_vs_T", "run_with_diagnostics",
+    # Constraint fingerprint
+    "Fingerprint", "ViolationStats", "fingerprint_bitstrings", "fingerprint_to_flat_dict",
     # Benchmark
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",

@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .bayes_opt import gp_minimize
+from .fingerprint import fingerprint_to_flat_dict
 from .flight import EvaluatedOption
 from .quantum_common import (
     BackendBudgetError,
@@ -166,23 +167,48 @@ class RydbergStatevector:
         self._detune_load = detune_load
         self._inter = inter
 
+    @property
+    def interaction_diag(self) -> np.ndarray:
+        """Read-only U·#edges-on(z) per basis state — reused by spectral.py."""
+        return self._inter
+
+    @property
+    def detune_load(self) -> np.ndarray:
+        """Read-only sum_i u_i·bit_i(z) per basis state — reused by spectral.py."""
+        return self._detune_load
+
     def run(
         self,
         schedule: AnnealSchedule,
         n_steps: int = 500,
         on_step: Callable[[int, int], None] | None = None,
+        *,
+        observer: Callable[[int, np.ndarray], None] | None = None,
+        observe_stride: int = 0,
     ) -> np.ndarray:
         """Evolve |00...0> under H(t) and return the 2^n outcome probabilities.
 
         `on_step(steps_done, n_steps)` fires every ~5% of the integration —
         a liveness heartbeat for callers (one evolution at 19-20 qubits takes
         minutes, and without this there is no sign of life in between).
+
+        `observer(step, psi)` (§S4), when set, is ALWAYS called once with step=0
+        before the loop, and again after the SECOND half_phase multiply of step
+        k whenever observe_stride > 0 and (k+1) % observe_stride == 0.
+        observe_stride=0 (the default) skips only the periodic in-loop calls, so
+        a caller that only wants the initial state can leave it unset. `psi` is
+        the LIVE buffer: observers must not mutate it and must .copy() anything
+        they keep, since the next iteration overwrites it in place. `observer`
+        left as None (the default) must not change `probs` at all.
         """
         n = self.n
         dt = (schedule.T_ns / 1000.0) / n_steps  # us; energies are rad/us
         psi = np.zeros(1 << n, dtype=np.complex128)
         psi[0] = 1.0
         stride = max(1, n_steps // 20)
+
+        if observer is not None:
+            observer(0, psi)
 
         for k in range(n_steps):
             s = (k + 0.5) / n_steps
@@ -202,6 +228,8 @@ class RydbergStatevector:
             psi *= half_phase
             if on_step is not None and (k + 1) % stride == 0:
                 on_step(k + 1, n_steps)
+            if observer is not None and observe_stride > 0 and (k + 1) % observe_stride == 0:
+                observer(k + 1, psi)
 
         probs = np.abs(psi) ** 2
         return probs / probs.sum()
@@ -391,9 +419,14 @@ def solve_pasqal_analog(
     iteration = 0
 
     def consume(samples: np.ndarray) -> float:
-        """Score one schedule's samples; update incumbent + history."""
+        """Score one schedule's samples; update incumbent + history.
+
+        collect_fingerprint=False: this fires once per BO probe (tuning
+        overhead) and only best_cost is read, so skip the extra repair pass
+        the §S5 fingerprint would cost here.
+        """
         nonlocal best_cost, best_indices, iteration
-        evaluation = evaluate_samples(graph, samples)
+        evaluation = evaluate_samples(graph, samples, collect_fingerprint=False)
         if evaluation.best_cost < best_cost:
             best_cost = evaluation.best_cost
             best_indices = evaluation.best_indices
@@ -458,12 +491,18 @@ def solve_pasqal_analog(
         delta_init=float(bo.x_best[2]),
         delta_final=float(bo.x_best[3]),
     )
+    # Time ONLY the final high-statistics evolution + sampling: this is the
+    # per-shot cost t_shot the TTS metric needs. The BO loop above is tuning
+    # overhead, reported separately (the gap between tts_sample and tts_total
+    # in the benchmark IS the BO cost).
+    t_sample0 = time.perf_counter()
     if use_pulser:
         final_samples = _pulser_sample(graph, best_schedule, shots=n_shots)
     else:
         assert sim is not None
         probs = evolve(best_schedule, "final sampling at the best schedule", bo_iters)
         final_samples = _sample_bits(probs, graph.n, n_shots, rng)
+    final_sampling_wall_clock_s = time.perf_counter() - t_sample0
 
     evaluation = evaluate_samples(graph, final_samples)
     if evaluation.best_cost > best_cost:
@@ -489,5 +528,9 @@ def solve_pasqal_analog(
             "n_qubits": graph.n,
             "bo_iters": bo_iters,
             "mean_penalized_energy": round(bo.y_best, 2),
+            "final_sampling_wall_clock_s": final_sampling_wall_clock_s,
+            "fingerprint": (
+                fingerprint_to_flat_dict(evaluation.fingerprint) if evaluation.fingerprint else {}
+            ),
         },
     )

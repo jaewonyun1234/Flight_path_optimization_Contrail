@@ -31,10 +31,14 @@ import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 
+from .analysis import feasible_cost_landscape, ground_state_degeneracy
+from .classical_baselines import solve_random_repair, solve_simulated_annealing
 from .flight import EvaluatedOption
+from .metrics import success_probability, time_to_solution
 from .options import build_and_evaluate_flight, build_random_flights
 from .pasqal_analog import solve_pasqal_analog
 from .quantum_common import BackendBudgetError, QuantumResult
@@ -58,7 +62,7 @@ ResultCallback = Callable[[int, "SolverRun"], None]
 # so a GUI can prove the sweep is alive even when one BO eval takes minutes.
 PhaseCallback = Callable[[str, float], None]
 
-SOLVER_NAMES = ("cpsat", "pasqal-analog", "xanadu-gbs")
+SOLVER_NAMES = ("cpsat", "random-repair", "sa", "pasqal-analog", "xanadu-gbs")
 
 
 # =============================================================================
@@ -79,11 +83,28 @@ class SolverRun:
     n_samples: int = 0
     history: list[tuple[int, float]] = field(default_factory=list)
     note: str = ""
+    # Per-shot statistics (§S2). success_prob = fraction of repaired shots that
+    # hit E*_exact; tts_sample_s uses only the sampling wall clock; tts_total_s
+    # amortizes the full pipeline (the gap is the BO / tuning overhead).
+    success_prob: float = math.nan
+    tts_sample_s: float = math.nan
+    tts_total_s: float = math.nan
+    # Constraint-violation fingerprint means (§S5), from the RAW pre-repair
+    # batch. NaN for CP-SAT (no raw samples) and for FAILED/SKIPPED cells.
+    onehot_deficit_mean: float = math.nan
+    onehot_excess_mean: float = math.nan
+    conflict_viol_mean: float = math.nan
+    capacity_overflow_mean: float = math.nan
+    repair_dist_mean: float = math.nan
+    # Solver-specific parameters (QuantumResult.meta, copied verbatim). The GUI
+    # Dynamics tab reads T_ns/omega_max_rad_us/delta_init_rad_us/delta_final_rad_us
+    # off a pasqal-analog run's meta for its "Load BO-best" button.
+    meta: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
 class InstanceResult:
-    """All three solver runs on one seeded instance."""
+    """All solver runs on one seeded instance."""
 
     seed: int
     optimum: float
@@ -91,6 +112,14 @@ class InstanceResult:
     n_conflicts: int
     n_buckets: int
     runs: list[SolverRun] = field(default_factory=list)
+    # Exact optimum (sum of c_i over the CP-SAT choice), NOT the cent-quantized
+    # objective — this is the success threshold for p_s (§S2). math.nan until
+    # CP-SAT has solved.
+    optimum_exact: float = math.nan
+    # Exact ground-state degeneracy (§S5), from feasible_cost_landscape; None
+    # when the instance is too large to enumerate (ValueError, small-instance
+    # tool by construction).
+    n_ground_states: int | None = None
 
     def run_for(self, solver: str) -> SolverRun | None:
         for run in self.runs:
@@ -110,6 +139,12 @@ class SolverStats:
     ratio_ci_high: float
     feasibility_mean: float
     wall_clock_mean_s: float
+    # §S2 aggregates. TTS is heavy-tailed (a single p_s = 0 seed makes it
+    # infinite), so it is summarized with the median + IQR across seeds, never
+    # a bootstrap mean. tts_* use the sampling-only TTS (tts_sample_s).
+    success_mean: float = math.nan
+    tts_median_s: float = math.nan
+    tts_iqr_s: float = math.nan
 
 
 @dataclass
@@ -125,15 +160,22 @@ class BenchmarkReport:
             ratios: list[float] = []
             feas: list[float] = []
             walls: list[float] = []
+            succ: list[float] = []
+            tts: list[float] = []
             for inst in self.instances:
                 run = inst.run_for(solver)
                 if run is not None and run.status == "OK":
                     ratios.append(run.approx_ratio)
                     feas.append(run.feasibility_rate)
                     walls.append(run.wall_clock_s)
+                    if not math.isnan(run.success_prob):
+                        succ.append(run.success_prob)
+                    if not math.isnan(run.tts_sample_s):
+                        tts.append(run.tts_sample_s)
             if not ratios:
                 continue
             lo, hi = bootstrap_ci(ratios, rng=np.random.default_rng(rng_seed))
+            tts_median, tts_iqr = _tts_median_iqr(tts)
             stats[solver] = SolverStats(
                 solver=solver,
                 n_ok=len(ratios),
@@ -142,6 +184,9 @@ class BenchmarkReport:
                 ratio_ci_high=hi,
                 feasibility_mean=float(np.mean(feas)),
                 wall_clock_mean_s=float(np.mean(walls)),
+                success_mean=float(np.mean(succ)) if succ else math.nan,
+                tts_median_s=tts_median,
+                tts_iqr_s=tts_iqr,
             )
         return stats
 
@@ -149,13 +194,15 @@ class BenchmarkReport:
         """Plain-text summary table (one row per solver)."""
         lines = [
             f"{'solver':<14} {'n':>3} {'ratio':>7} {'95% CI':>17} "
-            f"{'feas%':>7} {'wall':>9}",
+            f"{'feas%':>7} {'succ%':>7} {'medTTS':>9} {'wall':>9}",
         ]
         for s in self.aggregate().values():
+            succ = "—" if math.isnan(s.success_mean) else f"{100 * s.success_mean:.1f}"
             lines.append(
                 f"{s.solver:<14} {s.n_ok:>3} {s.ratio_mean:>7.4f} "
                 f"[{s.ratio_ci_low:.4f}, {s.ratio_ci_high:.4f}] "
-                f"{100 * s.feasibility_mean:>6.1f} {1000 * s.wall_clock_mean_s:>7.0f}ms"
+                f"{100 * s.feasibility_mean:>6.1f} {succ:>7} "
+                f"{_fmt_tts(s.tts_median_s):>9} {1000 * s.wall_clock_mean_s:>7.0f}ms"
             )
         return "\n".join(lines)
 
@@ -164,19 +211,53 @@ class BenchmarkReport:
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "seed", "solver", "backend", "status", "optimum", "best_cost",
-                "approx_ratio", "feasibility_rate", "wall_clock_s",
-                "n_samples", "n_options", "n_conflicts", "note",
+                "seed", "solver", "backend", "status", "optimum", "optimum_exact",
+                "best_cost", "approx_ratio", "feasibility_rate",
+                "success_prob", "tts_sample_s", "tts_total_s", "wall_clock_s",
+                "n_samples", "n_options", "n_conflicts", "n_ground_states",
+                "onehot_deficit_mean", "onehot_excess_mean", "conflict_viol_mean",
+                "capacity_overflow_mean", "repair_dist_mean", "note",
             ])
             for inst in self.instances:
                 for run in inst.runs:
                     writer.writerow([
                         inst.seed, run.solver, run.backend, run.status,
-                        f"{inst.optimum:.2f}", f"{run.best_cost:.2f}",
+                        f"{inst.optimum:.2f}", f"{inst.optimum_exact:.6f}",
+                        f"{run.best_cost:.2f}",
                         f"{run.approx_ratio:.6f}", f"{run.feasibility_rate:.4f}",
+                        f"{run.success_prob:.6f}", f"{run.tts_sample_s:.6g}",
+                        f"{run.tts_total_s:.6g}",
                         f"{run.wall_clock_s:.4f}", run.n_samples,
-                        inst.n_options, inst.n_conflicts, run.note,
+                        inst.n_options, inst.n_conflicts,
+                        "" if inst.n_ground_states is None else inst.n_ground_states,
+                        f"{run.onehot_deficit_mean:.6g}", f"{run.onehot_excess_mean:.6g}",
+                        f"{run.conflict_viol_mean:.6g}", f"{run.capacity_overflow_mean:.6g}",
+                        f"{run.repair_dist_mean:.6g}", run.note,
                     ])
+
+
+def _fmt_tts(tts_s: float) -> str:
+    """Render a TTS for the text table: '∞' for infinite, else seconds."""
+    if math.isnan(tts_s):
+        return "—"
+    if math.isinf(tts_s):
+        return "∞"
+    return f"{tts_s:.3g}s"
+
+
+def _tts_median_iqr(values: Sequence[float]) -> tuple[float, float]:
+    """Median + inter-quartile range of a heavy-tailed TTS sample.
+
+    inf values (p_s = 0 seeds) are kept: numpy's median/percentile propagate
+    them faithfully, so a solver that fails on most seeds gets an infinite
+    median — which is the honest summary, not a silently dropped tail.
+    """
+    if not values:
+        return math.nan, math.nan
+    arr = np.asarray(values, dtype=float)
+    median = float(np.median(arr))
+    q25, q75 = np.percentile(arr, [25, 75])
+    return median, float(q75 - q25)
 
 
 def bootstrap_ci(
@@ -200,8 +281,31 @@ def bootstrap_ci(
 # THE PROTOCOL
 # =============================================================================
 
-def _quantum_to_run(result: QuantumResult, optimum: float, wall_clock_s: float) -> SolverRun:
-    """Convert a QuantumResult into a benchmark cell."""
+def _quantum_to_run(
+    result: QuantumResult, optimum: float, optimum_exact: float, wall_clock_s: float
+) -> SolverRun:
+    """Convert a QuantumResult into a benchmark cell, with §S2 per-shot stats."""
+    # p_s and both TTS variants (sampling-only vs full-pipeline amortized).
+    success = math.nan
+    tts_sample = math.nan
+    tts_total = math.nan
+    if result.evaluation is not None and not math.isnan(optimum_exact):
+        success = success_probability(result.evaluation, optimum_exact)
+        n = max(1, result.n_samples)
+        t_sample_wall = cast(float, result.meta.get("final_sampling_wall_clock_s", wall_clock_s))
+        tts_sample = time_to_solution(float(t_sample_wall) / n, success)
+        tts_total = time_to_solution(wall_clock_s / n, success)
+
+    # §S5 constraint-violation fingerprint, from the RAW pre-repair batch.
+    deficit = excess = conflict_v = overflow = repair_dist = math.nan
+    if result.evaluation is not None and result.evaluation.fingerprint is not None:
+        fp = result.evaluation.fingerprint
+        deficit = fp.onehot_deficit.mean
+        excess = fp.onehot_excess.mean
+        conflict_v = fp.conflict.mean
+        overflow = fp.capacity_overflow.mean
+        repair_dist = fp.repair_distance.mean
+
     return SolverRun(
         solver=result.solver,
         backend=result.backend,
@@ -212,6 +316,15 @@ def _quantum_to_run(result: QuantumResult, optimum: float, wall_clock_s: float) 
         wall_clock_s=wall_clock_s,
         n_samples=result.n_samples,
         history=list(result.history),
+        success_prob=success,
+        tts_sample_s=tts_sample,
+        tts_total_s=tts_total,
+        onehot_deficit_mean=deficit,
+        onehot_excess_mean=excess,
+        conflict_viol_mean=conflict_v,
+        capacity_overflow_mean=overflow,
+        repair_dist_mean=repair_dist,
+        meta=dict(result.meta),
     )
 
 
@@ -226,11 +339,18 @@ def _run_instance(
     cpsat_time_limit_s: float,
     pasqal_backend: str,
     xanadu_backend: str,
+    solvers: Sequence[str] | None,
     on_progress: ProgressCallback | None,
     on_result: ResultCallback | None,
     on_phase: PhaseCallback | None,
 ) -> InstanceResult:
-    """Steps 1-5 of the §10.1 protocol on one instance."""
+    """Steps 1-5 of the §10.1 protocol on one instance.
+
+    `solvers` filters the non-CP-SAT solvers (CP-SAT always runs — it defines
+    the exact optimum E*). None runs every solver in SOLVER_NAMES.
+    """
+    def enabled(name: str) -> bool:
+        return solvers is None or name in solvers
     instance = InstanceResult(
         seed=seed,
         optimum=math.nan,
@@ -260,6 +380,11 @@ def _run_instance(
         on_progress=cpsat_progress,
     )
     instance.optimum = cpsat.objective
+    # Exact optimum on the same float path as repaired sample costs (NOT the
+    # cent-quantized objective) — this is the success threshold for p_s (§S2).
+    instance.optimum_exact = float(
+        sum(evals[i].cost_combined for i in cpsat.chosen_eval_indices)
+    )
     emit(SolverRun(
         solver="cpsat",
         backend="ortools",
@@ -275,51 +400,95 @@ def _run_instance(
     if instance.runs[0].status != "OK":
         return instance  # no ground truth -> ratios undefined; skip quantum
 
-    # --- 2. Pasqal analog-QAOA + BO ---------------------------------------
-    def pasqal_progress(step: int, cost: float) -> None:
-        if on_progress is not None:
-            on_progress("pasqal-analog", step, cost)
-
-    def pasqal_phase(message: str, frac: float) -> None:
-        if on_phase is not None:
-            on_phase(f"seed {seed}: Pasqal {message}", frac)
-
+    # Exact ground-state degeneracy (§S5) — a small-instance tool by
+    # construction; the enumerator refuses instances it can't afford.
     try:
-        t0 = time.perf_counter()
-        pasqal = solve_pasqal_analog(
-            evals, conflicts, buckets,
-            n_shots=n_shots, bo_iters=bo_iters, seed=seed,
-            backend=pasqal_backend, on_progress=pasqal_progress,
-            on_phase=pasqal_phase,
-        )
-        emit(_quantum_to_run(pasqal, instance.optimum, time.perf_counter() - t0))
-    except BackendBudgetError as exc:
-        emit(SolverRun(solver="pasqal-analog", backend="-", status="SKIPPED", note=str(exc)))
-    except Exception as exc:  # surface, don't kill the sweep
-        emit(SolverRun(solver="pasqal-analog", backend="-", status="FAILED", note=str(exc)))
+        costs, _opt = feasible_cost_landscape(evals, conflicts, buckets)
+        instance.n_ground_states = ground_state_degeneracy(costs, instance.optimum_exact)
+    except ValueError:
+        instance.n_ground_states = None
 
-    # --- 3. Xanadu GBS ------------------------------------------------------
-    def xanadu_progress(step: int, cost: float) -> None:
-        if on_progress is not None:
-            on_progress("xanadu-gbs", step, cost)
-        if on_phase is not None:
-            on_phase(
-                f"seed {seed}: GBS sampling {step}/{n_shots} subsets",
-                min(1.0, step / n_shots),
+    # --- 2. Classical samplers (null control + SA) ------------------------
+    # Same output budget (n_shots samples) and the same repair as the quantum
+    # pipelines, so they compete on identical footing.
+    def run_baseline(name: str, solver_fn: Callable[..., QuantumResult]) -> None:
+        def baseline_progress(step: int, cost: float) -> None:
+            if on_progress is not None:
+                on_progress(name, step, cost)
+            if on_phase is not None:
+                on_phase(
+                    f"seed {seed}: {name} sampling ({step}/{n_shots})",
+                    min(1.0, step / max(1, n_shots)),
+                )
+
+        try:
+            t0 = time.perf_counter()
+            result = solver_fn(
+                evals, conflicts, buckets,
+                n_samples=n_shots, seed=seed, on_progress=baseline_progress,
             )
+            emit(_quantum_to_run(
+                result, instance.optimum, instance.optimum_exact, time.perf_counter() - t0,
+            ))
+        except Exception as exc:  # samplers have no budget cap, but stay defensive
+            emit(SolverRun(solver=name, backend="-", status="FAILED", note=str(exc)))
 
-    try:
-        t0 = time.perf_counter()
-        xanadu = solve_xanadu_gbs(
-            evals, conflicts, buckets,
-            n_samples=n_shots, seed=seed,
-            backend=xanadu_backend, on_progress=xanadu_progress,
-        )
-        emit(_quantum_to_run(xanadu, instance.optimum, time.perf_counter() - t0))
-    except BackendBudgetError as exc:
-        emit(SolverRun(solver="xanadu-gbs", backend="-", status="SKIPPED", note=str(exc)))
-    except Exception as exc:
-        emit(SolverRun(solver="xanadu-gbs", backend="-", status="FAILED", note=str(exc)))
+    if enabled("random-repair"):
+        run_baseline("random-repair", solve_random_repair)
+    if enabled("sa"):
+        run_baseline("sa", solve_simulated_annealing)
+
+    # --- 3. Pasqal analog-QAOA + BO ---------------------------------------
+    if enabled("pasqal-analog"):
+        def pasqal_progress(step: int, cost: float) -> None:
+            if on_progress is not None:
+                on_progress("pasqal-analog", step, cost)
+
+        def pasqal_phase(message: str, frac: float) -> None:
+            if on_phase is not None:
+                on_phase(f"seed {seed}: Pasqal {message}", frac)
+
+        try:
+            t0 = time.perf_counter()
+            pasqal = solve_pasqal_analog(
+                evals, conflicts, buckets,
+                n_shots=n_shots, bo_iters=bo_iters, seed=seed,
+                backend=pasqal_backend, on_progress=pasqal_progress,
+                on_phase=pasqal_phase,
+            )
+            emit(_quantum_to_run(
+                pasqal, instance.optimum, instance.optimum_exact, time.perf_counter() - t0,
+            ))
+        except BackendBudgetError as exc:
+            emit(SolverRun(solver="pasqal-analog", backend="-", status="SKIPPED", note=str(exc)))
+        except Exception as exc:  # surface, don't kill the sweep
+            emit(SolverRun(solver="pasqal-analog", backend="-", status="FAILED", note=str(exc)))
+
+    # --- 4. Xanadu GBS ------------------------------------------------------
+    if enabled("xanadu-gbs"):
+        def xanadu_progress(step: int, cost: float) -> None:
+            if on_progress is not None:
+                on_progress("xanadu-gbs", step, cost)
+            if on_phase is not None:
+                on_phase(
+                    f"seed {seed}: GBS sampling {step}/{n_shots} subsets",
+                    min(1.0, step / n_shots),
+                )
+
+        try:
+            t0 = time.perf_counter()
+            xanadu = solve_xanadu_gbs(
+                evals, conflicts, buckets,
+                n_samples=n_shots, seed=seed,
+                backend=xanadu_backend, on_progress=xanadu_progress,
+            )
+            emit(_quantum_to_run(
+                xanadu, instance.optimum, instance.optimum_exact, time.perf_counter() - t0,
+            ))
+        except BackendBudgetError as exc:
+            emit(SolverRun(solver="xanadu-gbs", backend="-", status="SKIPPED", note=str(exc)))
+        except Exception as exc:
+            emit(SolverRun(solver="xanadu-gbs", backend="-", status="FAILED", note=str(exc)))
 
     return instance
 
@@ -333,11 +502,14 @@ def run_benchmark(
     cpsat_time_limit_s: float = 10.0,
     pasqal_backend: str = "auto",
     xanadu_backend: str = "auto",
+    solvers: Sequence[str] | None = None,
     on_progress: ProgressCallback | None = None,
     on_result: ResultCallback | None = None,
     on_phase: PhaseCallback | None = None,
 ) -> BenchmarkReport:
     """Run the full §10.1 protocol over the given seeds.
+
+    `solvers` filters the non-CP-SAT solvers (CP-SAT always runs); None = all.
 
     Callbacks (all optional, used by the GUI):
         on_progress(solver, step, best_cost_so_far) — live convergence;
@@ -356,6 +528,7 @@ def run_benchmark(
             cpsat_time_limit_s=cpsat_time_limit_s,
             pasqal_backend=pasqal_backend,
             xanadu_backend=xanadu_backend,
+            solvers=solvers,
             on_progress=on_progress,
             on_result=on_result,
             on_phase=on_phase,
@@ -403,14 +576,21 @@ def main() -> None:
     parser.add_argument("--shots", type=int, default=1000)
     parser.add_argument("--bo-iters", type=int, default=15)
     parser.add_argument("--csv", type=str, default="", help="optional CSV output path")
+    parser.add_argument(
+        "--solvers", type=str, default="",
+        help="comma list filtering the non-CP-SAT solvers "
+             "(e.g. sa,pasqal-analog); CP-SAT always runs",
+    )
     args = parser.parse_args()
 
+    solvers = [s.strip() for s in args.solvers.split(",") if s.strip()] or None
     factory = default_scenario_factory(n_flights=args.flights)
     report = run_benchmark(
         factory,
         seeds=range(args.seeds),
         n_shots=args.shots,
         bo_iters=args.bo_iters,
+        solvers=solvers,
     )
     print(report.format_table())
     if args.csv:

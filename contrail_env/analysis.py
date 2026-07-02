@@ -80,6 +80,17 @@ def feasible_cost_landscape(
     return arr, optimum
 
 
+def ground_state_degeneracy(costs: np.ndarray, optimum: float, *, rel_tol: float = 1e-9) -> int:
+    """Exact |P_0|: #assignments with cost <= optimum*(1+rel_tol)+1e-12.
+
+    `costs` is the array feasible_cost_landscape returns. Cross-checks
+    AnalogSpectrum.end_degeneracy (S3) from an independent, non-quantum path.
+    A small-instance tool by construction (feasible_cost_landscape already is).
+    """
+    threshold = optimum * (1.0 + rel_tol) + 1e-12
+    return int(np.sum(np.asarray(costs, dtype=float) <= threshold))
+
+
 # ===========================================================================
 # 2. SAMPLER QUALITY — repaired-cost distributions
 # ===========================================================================

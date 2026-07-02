@@ -40,6 +40,7 @@ PANELS
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -51,11 +52,13 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
+import pyqtgraph.exporters  # noqa: F401  (registers pg.exporters.ImageExporter)
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -83,11 +86,92 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     QWebEngineView = None  # type: ignore[assignment, misc]
     _HAS_WEBENGINE = False
 
-from contrail_env import assemble_qubo, fl_to_m, waypoints_for
-from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
+from contrail_env import World, assemble_qubo, fl_to_m, waypoints_for
+from contrail_env.benchmark import SOLVER_NAMES, BenchmarkReport, run_benchmark
+from contrail_env.dynamics import DynamicsRecord, ResidualEnergyResult
 from contrail_env.geo import EUROPEAN_ANCHOR
-from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
+from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS, OMEGA_MAX_HW, T_MAX_NS
 from contrail_env.scenario import ScenarioConfig, build_scenario_full, solve_scenario
+from contrail_env.spectral import AnalogSpectrum
+
+# One pen colour per solver, used consistently across every tab so a solver is
+# recognisable by colour alone (benchmark bars, convergence curves, fingerprint
+# bars). Keys are the SOLVER_NAMES of contrail_env.benchmark.
+SOLVER_PENS: dict[str, str] = {
+    "cpsat": "g",
+    "random-repair": "w",
+    "sa": "c",
+    "pasqal-analog": "m",
+    "xanadu-gbs": "y",
+}
+
+# Pens for the entropy-cut curves (Dynamics tab) — order-stable, one per cut.
+_CUT_PENS = ["c", "y", "m", "w"]
+
+# Constraint-violation families (G3): the four pre-repair violation kinds, the
+# SolverRun attribute each reads, and one colour each for the grouped bar chart.
+_FP_FAMILIES = ["deficit", "excess", "conflict", "overflow"]
+_FP_FAMILY_ATTR = {
+    "deficit": "onehot_deficit_mean",
+    "excess": "onehot_excess_mean",
+    "conflict": "conflict_viol_mean",
+    "overflow": "capacity_overflow_mean",
+}
+_FP_FAMILY_COLORS = {
+    "deficit": "#e15759", "excess": "#4e79a7",
+    "conflict": "#f28e2b", "overflow": "#59a14f",
+}
+
+# §0.5 honesty sentence — entropy and the spectral gap locate the sweep's
+# critical window; they are not performance validation. Verbatim per spec.
+_DYN_HONESTY = (
+    "entanglement entropy and the spectral gap are dynamics diagnostics that "
+    "locate the critical window of the analog sweep; they are not evidence of "
+    "computational usefulness."
+)
+
+
+def _export_rows_csv(parent: QWidget, header: list[str], rows: list[list[object]]) -> None:
+    """Prompt for a path and write `header` + `rows` as CSV (the raw plot data)."""
+    import csv
+
+    path, _ = QFileDialog.getSaveFileName(parent, "Export CSV", "", "CSV files (*.csv)")
+    if not path:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _export_plot_png(parent: QWidget, plot: pg.PlotWidget | pg.GraphicsLayoutWidget) -> None:
+    """Prompt for a path and export a pyqtgraph plot/scene as a PNG image."""
+    path, _ = QFileDialog.getSaveFileName(parent, "Export PNG", "", "PNG image (*.png)")
+    if not path:
+        return
+    item = plot.plotItem if isinstance(plot, pg.PlotWidget) else plot.ci
+    exporter = pg.exporters.ImageExporter(item)
+    exporter.export(path)
+
+
+def _fmt_tts_s(tts_s: float) -> str:
+    """Render a TTS for a table cell: '∞' for infinite, '—' for undefined."""
+    if math.isnan(tts_s):
+        return "—"
+    if math.isinf(tts_s):
+        return "∞"
+    return f"{tts_s:.3g}s"
+
+
+def _stretch_last(table: QTableWidget, *, hide_vertical: bool = False) -> None:
+    """Stretch a table's last column (the Qt stub types the header as optional)."""
+    header = table.horizontalHeader()
+    if header is not None:
+        header.setStretchLastSection(True)
+    if hide_vertical:
+        v_header = table.verticalHeader()
+        if v_header is not None:
+            v_header.setVisible(False)
 
 # Fixed scenario knobs not exposed as controls (sensible defaults per the brief).
 CORRIDOR_FRAC = 0.05
@@ -427,12 +511,22 @@ class MainWindow(QMainWindow):
         self._worker: SolveWorker | None = None
         self._bench_worker: BenchmarkWorker | None = None
         self._pending_cfg: ScenarioConfig | None = None
+        # Last completed benchmark report — read by the exports and by the
+        # constraint-fingerprint tab (G3).
+        self._bench_report: BenchmarkReport | None = None
 
         # Research-tab workers (landscape / quantum convergence / hardness sweep).
         self._land_worker: _AnalysisWorker | None = None
         self._qconv_worker: _AnalysisWorker | None = None
         self._hard_worker: _AnalysisWorker | None = None
         self._qconv_data: dict[str, tuple[list, list]] = {"pasqal": ([], []), "gbs": ([], [])}
+
+        # Quantum-dynamics tab workers + last results (G2).
+        self._dyn_worker: _AnalysisWorker | None = None
+        self._dyn_residual_worker: _AnalysisWorker | None = None
+        self._dyn_spectrum: AnalogSpectrum | None = None
+        self._dyn_record: DynamicsRecord | None = None
+        self._dyn_residual: ResidualEnergyResult | None = None
 
         # Benchmark progress state (see _on_bench_phase / _refresh_bench_status).
         self._bench_t0 = 0.0
@@ -446,7 +540,7 @@ class MainWindow(QMainWindow):
         self._groups: OrderedDict[str, list[int]] = OrderedDict()
         self._graph_texts: list[pg.TextItem] = []
         # World + flights kept for the geographic map panel.
-        self._world: object | None = None
+        self._world: World | None = None
         self._flights: list = []
 
         self._build_ui()
@@ -525,6 +619,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_results_tab(), "6 · Trade-offs")
         self.tabs.addTab(self._build_benchmark_tab(), "7 · Quantum benchmark")
         self.tabs.addTab(self._build_map_tab(), "8 · Map")
+        self.tabs.addTab(self._build_dynamics_tab(), "9 · Quantum dynamics")
+        self.tabs.addTab(self._build_fingerprint_tab(), "10 · Constraint fingerprint")
 
         root = QHBoxLayout()
         root.addWidget(left_widget)
@@ -820,7 +916,7 @@ class MainWindow(QMainWindow):
         self.results.setHorizontalHeaderLabels(
             ["Flight", "Chosen opt#", "Fuel (kg)", "Contrail cells", "Disruption (FL-min)"]
         )
-        self.results.horizontalHeader().setStretchLastSection(True)
+        _stretch_last(self.results)
         return self.results
 
     def _build_benchmark_tab(self) -> QWidget:
@@ -842,10 +938,18 @@ class MainWindow(QMainWindow):
         self.bench_btn.clicked.connect(self._on_run_benchmark)
 
         self.bench_status = QLabel(
-            "idle — runs CP-SAT, Pasqal analog-QAOA, and Xanadu GBS on the "
-            "current instance over N seeds (seed, seed+1, …)"
+            "idle — CP-SAT is the exact verifier at this size; the quantum + "
+            "classical samplers are compared at matched output budget."
         )
         self.bench_status.setFont(_MONO)
+
+        # Export buttons (enabled once a report exists — G3 reads it too).
+        self.bench_export_csv_btn = QPushButton("Export CSV…")
+        self.bench_export_csv_btn.clicked.connect(self._on_export_bench_csv)
+        self.bench_export_png_btn = QPushButton("Export table PNG…")
+        self.bench_export_png_btn.clicked.connect(self._on_export_bench_png)
+        self.bench_export_csv_btn.setEnabled(False)
+        self.bench_export_png_btn.setEnabled(False)
 
         # Overall sweep progress: 100 units per (seed, solver) cell, with the
         # heartbeat filling the current cell fractionally — so the bar moves
@@ -870,16 +974,18 @@ class MainWindow(QMainWindow):
             controls.addWidget(widget)
         controls.addWidget(self.bench_btn)
         controls.addWidget(self.bench_progress)
+        controls.addWidget(self.bench_export_csv_btn)
+        controls.addWidget(self.bench_export_png_btn)
         controls.addWidget(self.bench_status, stretch=1)
 
         # --- aggregate table ---------------------------------------------------
-        self.bench_table = QTableWidget(len(SOLVER_NAMES), 7)
-        self.bench_table.setHorizontalHeaderLabels([
-            "Solver", "Backend", "E_best (mean)", "Approx ratio r",
-            "r 95% CI", "Raw feas %", "Wall (ms)",
-        ])
-        self.bench_table.horizontalHeader().setStretchLastSection(True)
-        self.bench_table.verticalHeader().setVisible(False)
+        self.bench_columns = [
+            "Solver", "Backend", "E_best (mean)", "Approx ratio r", "r 95% CI",
+            "Raw feas %", "Succ %", "TTS99 (med)", "Wall (ms)",
+        ]
+        self.bench_table = QTableWidget(len(SOLVER_NAMES), len(self.bench_columns))
+        self.bench_table.setHorizontalHeaderLabels(self.bench_columns)
+        _stretch_last(self.bench_table, hide_vertical=True)
         for row, name in enumerate(SOLVER_NAMES):
             self.bench_table.setItem(row, 0, QTableWidgetItem(name))
 
@@ -909,14 +1015,23 @@ class MainWindow(QMainWindow):
         )
         self.pasqal_plot.addItem(self.pasqal_opt_line)
 
+        # Xanadu GBS + the classical SA baseline share this "cost vs samples"
+        # plot (both stream best-cost-so-far against sample count); colour tells
+        # them apart via SOLVER_PENS.
         self.xanadu_plot = pg.PlotWidget(
-            title="Xanadu GBS — best repaired cost vs samples"
+            title="Samplers — best repaired cost vs samples (Xanadu GBS + SA baseline)"
         )
         self.xanadu_plot.setLabel("bottom", "samples drawn")
         self.xanadu_plot.setLabel("left", "best combined cost")
         self.xanadu_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.xanadu_plot.addLegend()
         self.xanadu_curve = self.xanadu_plot.plot(
-            [], [], pen=pg.mkPen("y", width=2), symbol="o", symbolSize=6
+            [], [], pen=pg.mkPen(SOLVER_PENS["xanadu-gbs"], width=2),
+            symbol="o", symbolSize=6, name="Xanadu GBS",
+        )
+        self.sa_curve = self.xanadu_plot.plot(
+            [], [], pen=pg.mkPen(SOLVER_PENS["sa"], width=2),
+            symbol="t", symbolSize=6, name="SA baseline",
         )
         self.xanadu_opt_line = pg.InfiniteLine(
             angle=0, pen=pg.mkPen("g", style=Qt.PenStyle.DashLine)
@@ -926,6 +1041,12 @@ class MainWindow(QMainWindow):
         self._bench_curves: dict[str, tuple[list[int], list[float]]] = {
             "pasqal-analog": ([], []),
             "xanadu-gbs": ([], []),
+            "sa": ([], []),
+        }
+        self._bench_curve_items = {
+            "pasqal-analog": self.pasqal_curve,
+            "xanadu-gbs": self.xanadu_curve,
+            "sa": self.sa_curve,
         }
 
         # --- layout ---------------------------------------------------------
@@ -945,6 +1066,222 @@ class MainWindow(QMainWindow):
         root.addLayout(controls)
         root.addWidget(mid_w, stretch=2)
         root.addWidget(bottom_w, stretch=3)
+        wrap = QWidget()
+        wrap.setLayout(root)
+        return wrap
+
+    # ------------------------------------------------ tab 9: quantum dynamics ---
+    def _build_dynamics_tab(self) -> QWidget:
+        # Schedule spinboxes, clamped to the imported hardware envelope / BO box.
+        self.dyn_T = QDoubleSpinBox()
+        self.dyn_T.setRange(1500.0, T_MAX_NS)
+        self.dyn_T.setSingleStep(100.0)
+        self.dyn_T.setValue(4000.0)
+        self.dyn_omega = QDoubleSpinBox()
+        self.dyn_omega.setRange(0.1, OMEGA_MAX_HW)
+        self.dyn_omega.setSingleStep(0.5)
+        self.dyn_omega.setValue(10.0)
+        self.dyn_di = QDoubleSpinBox()
+        self.dyn_di.setRange(-14.0, -2.0)
+        self.dyn_di.setSingleStep(0.5)
+        self.dyn_di.setValue(-8.0)
+        self.dyn_df = QDoubleSpinBox()
+        self.dyn_df.setRange(2.0, 14.0)
+        self.dyn_df.setSingleStep(0.5)
+        self.dyn_df.setValue(8.0)
+        self.dyn_steps = QSpinBox()
+        self.dyn_steps.setRange(200, 1000)
+        self.dyn_steps.setSingleStep(50)
+        self.dyn_steps.setValue(500)
+        self.dyn_records = QSpinBox()
+        self.dyn_records.setRange(10, 50)
+        self.dyn_records.setValue(25)
+
+        self.dyn_load_btn = QPushButton("Load BO-best")
+        self.dyn_load_btn.setEnabled(False)
+        self.dyn_load_btn.clicked.connect(self._on_load_bo_best)
+        self.dyn_btn = QPushButton("Compute dynamics")
+        self.dyn_btn.clicked.connect(self._on_compute_dynamics)
+        self.dyn_progress = QProgressBar()
+        self.dyn_progress.setRange(0, 100)
+        self.dyn_progress.setValue(0)
+        self.dyn_progress.setFixedWidth(180)
+
+        controls = QHBoxLayout()
+        for label, widget in (
+            ("T (ns)", self.dyn_T), ("Ω_max", self.dyn_omega),
+            ("δ_init", self.dyn_di), ("δ_final", self.dyn_df),
+            ("n_steps", self.dyn_steps), ("n_records", self.dyn_records),
+        ):
+            controls.addWidget(QLabel(label))
+            controls.addWidget(widget)
+        controls.addWidget(self.dyn_load_btn)
+        controls.addWidget(self.dyn_btn)
+        controls.addWidget(self.dyn_progress)
+        controls.addStretch(1)
+
+        # Residual-energy sweep controls + exports.
+        self.dyn_nT = QSpinBox()
+        self.dyn_nT.setRange(4, 12)
+        self.dyn_nT.setValue(8)
+        self.dyn_residual_btn = QPushButton("Run ε(T) sweep")
+        self.dyn_residual_btn.clicked.connect(self._on_run_residual)
+        self.dyn_export_csv_btn = QPushButton("Export CSV…")
+        self.dyn_export_csv_btn.clicked.connect(self._on_export_dynamics_csv)
+        self.dyn_export_png_btn = QPushButton("Export PNG…")
+        self.dyn_export_png_btn.clicked.connect(self._on_export_dynamics_png)
+        controls2 = QHBoxLayout()
+        controls2.addWidget(QLabel("ε(T) points"))
+        controls2.addWidget(self.dyn_nT)
+        controls2.addWidget(self.dyn_residual_btn)
+        controls2.addStretch(1)
+        controls2.addWidget(self.dyn_export_csv_btn)
+        controls2.addWidget(self.dyn_export_png_btn)
+
+        # 2x2 diagnostics grid.
+        self.dyn_glw = pg.GraphicsLayoutWidget()
+        self.dyn_levels_plot = self.dyn_glw.addPlot(row=0, col=0, title="Levels & gap")
+        self.dyn_levels_plot.setLabel("bottom", "s = t/T")
+        self.dyn_levels_plot.setLabel("left", "energy (rad/µs)")
+        self.dyn_levels_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._dyn_level_curves = [
+            self.dyn_levels_plot.plot([], [], pen=pg.mkPen((130, 130, 140), width=1))
+            for _ in range(6)
+        ]
+        self._dyn_gap_curve = self.dyn_levels_plot.plot(
+            [], [], pen=pg.mkPen("w", width=2), name="Δ(s)")
+        self.dyn_sstar_line = pg.InfiniteLine(
+            angle=90, pen=pg.mkPen("r", style=Qt.PenStyle.DashLine))
+        self.dyn_levels_plot.addItem(self.dyn_sstar_line)
+
+        self.dyn_entropy_plot = self.dyn_glw.addPlot(row=0, col=1, title="Entanglement entropy")
+        self.dyn_entropy_plot.setLabel("bottom", "t (ns)")
+        self.dyn_entropy_plot.setLabel("left", "S_A (nats)")
+        self.dyn_entropy_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.dyn_entropy_plot.addLegend()
+        self._dyn_entropy_curves = {
+            "flights_half": self.dyn_entropy_plot.plot(
+                [], [], pen=pg.mkPen(_CUT_PENS[0], width=2), name="flights_half"),
+            "index_half": self.dyn_entropy_plot.plot(
+                [], [], pen=pg.mkPen(_CUT_PENS[1], width=2), name="index_half"),
+        }
+
+        self.dyn_pground_plot = self.dyn_glw.addPlot(row=1, col=0, title="Ground-space population")
+        self.dyn_pground_plot.setLabel("bottom", "t (ns)")
+        self.dyn_pground_plot.setLabel("left", "P₀(t)")
+        self.dyn_pground_plot.setYRange(0.0, 1.0)
+        self.dyn_pground_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._dyn_pground_curve = self.dyn_pground_plot.plot(
+            [], [], pen=pg.mkPen("c", width=2))
+
+        self.dyn_energy_plot = self.dyn_glw.addPlot(row=1, col=1, title="⟨E_pen⟩(t)")
+        self.dyn_energy_plot.setLabel("bottom", "t (ns)")
+        self.dyn_energy_plot.setLabel("left", "⟨E_pen⟩")
+        self.dyn_energy_plot.showGrid(x=True, y=True, alpha=0.3)
+        self._dyn_energy_curve = self.dyn_energy_plot.plot(
+            [], [], pen=pg.mkPen("m", width=2))
+        self.dyn_energy_min_line = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen("g", style=Qt.PenStyle.DashLine))
+        self.dyn_energy_min_line.setVisible(False)
+        self.dyn_energy_plot.addItem(self.dyn_energy_min_line)
+
+        # Residual-energy sweep plot (log-log).
+        self.dyn_residual_plot = pg.PlotWidget(title="Residual energy ε(T) — run the sweep")
+        self.dyn_residual_plot.setLabel("bottom", "T (ns)")
+        self.dyn_residual_plot.setLabel("left", "ε(T)")
+        self.dyn_residual_plot.setLogMode(x=True, y=True)
+        self.dyn_residual_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.dyn_residual_curve = self.dyn_residual_plot.plot(
+            [], [], pen=pg.mkPen("y", width=2), symbol="o", symbolSize=6)
+
+        self.dyn_info = QLabel("Δ_min: —   s*: —   end_degeneracy: —   |P₀| exact: —")
+        self.dyn_info.setFont(_MONO)
+        self.dyn_status = QLabel(_DYN_HONESTY)
+        self.dyn_status.setFont(_MONO)
+        self.dyn_status.setWordWrap(True)
+
+        plots_row = QHBoxLayout()
+        plots_row.addWidget(self.dyn_glw, stretch=3)
+        plots_row.addWidget(self.dyn_residual_plot, stretch=1)
+        plots_w = QWidget()
+        plots_w.setLayout(plots_row)
+
+        root = QVBoxLayout()
+        root.addLayout(controls)
+        root.addLayout(controls2)
+        root.addWidget(plots_w, stretch=1)
+        root.addWidget(self.dyn_info)
+        root.addWidget(self.dyn_status)
+        wrap = QWidget()
+        wrap.setLayout(root)
+        return wrap
+
+    # ------------------------------------------- tab 10: constraint fingerprint ---
+    def _build_fingerprint_tab(self) -> QWidget:
+        self.fp_export_csv_btn = QPushButton("Export CSV…")
+        self.fp_export_csv_btn.clicked.connect(self._on_export_fp_csv)
+        self.fp_export_csv_btn.setEnabled(False)
+        self.fp_export_png_btn = QPushButton("Export PNG…")
+        self.fp_export_png_btn.clicked.connect(self._on_export_fp_png)
+        self.fp_export_png_btn.setEnabled(False)
+
+        self.fp_plot = pg.PlotWidget(
+            title="Raw-sample constraint violations, per family (pre-repair)")
+        self.fp_plot.setLabel("left", "mean violations per raw sample")
+        self.fp_plot.showGrid(y=True, alpha=0.3)
+        # A static family colour key in the legend (one square per family).
+        self._fp_legend = self.fp_plot.addLegend()
+        for fam in _FP_FAMILIES:
+            proxy = pg.ScatterPlotItem(
+                [], [], symbol="s", size=12, brush=pg.mkBrush(_FP_FAMILY_COLORS[fam]), pen=None)
+            self.fp_plot.addItem(proxy)
+            self._fp_legend.addItem(proxy, fam)
+        self._fp_bar_item: pg.BarGraphItem | None = None
+
+        self.fp_repair_plot = pg.PlotWidget(
+            title="Repair distance per solver (how far repair moved each platform's samples)")
+        self.fp_repair_plot.setLabel("bottom", "mean Hamming distance to repaired")
+        self.fp_repair_plot.showGrid(x=True, alpha=0.3)
+        self._fp_repair_item: pg.BarGraphItem | None = None
+
+        self.fp_info = QLabel()
+        self.fp_info.setTextFormat(Qt.TextFormat.RichText)
+        self.fp_info.setWordWrap(True)
+        self.fp_info.setText(
+            '<b>families:</b> '
+            '<span style="color:#e15759">deficit</span> · '
+            '<span style="color:#4e79a7">excess</span> · '
+            '<span style="color:#f28e2b">conflict</span> · '
+            '<span style="color:#59a14f">overflow</span> &nbsp;—&nbsp; '
+            "blockade → deficit-dominant expected on Pasqal; hafnian "
+            "density-weighting → excess/overflow-dominant expected on GBS — "
+            "the chart tests this.")
+
+        self.fp_status = QLabel(
+            "run a benchmark (tab 7) first; this tab decomposes each solver's "
+            "raw-sample constraint violations.")
+        self.fp_status.setFont(_MONO)
+        self.fp_status.setWordWrap(True)
+
+        # Aggregated rows kept for CSV export: (solver, family, mean).
+        self._fp_rows: list[tuple[str, str, float]] = []
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        controls.addWidget(self.fp_export_csv_btn)
+        controls.addWidget(self.fp_export_png_btn)
+
+        plots = QHBoxLayout()
+        plots.addWidget(self.fp_plot, stretch=3)
+        plots.addWidget(self.fp_repair_plot, stretch=1)
+        plots_w = QWidget()
+        plots_w.setLayout(plots)
+
+        root = QVBoxLayout()
+        root.addLayout(controls)
+        root.addWidget(plots_w, stretch=1)
+        root.addWidget(self.fp_info)
+        root.addWidget(self.fp_status)
         wrap = QWidget()
         wrap.setLayout(root)
         return wrap
@@ -1024,7 +1361,8 @@ class MainWindow(QMainWindow):
         z = np.array([w[2] for w in wps], dtype=float)
         s_km = np.hypot(x - x[0], y - y[0])          # distance flown from origin
         fl = z / 0.3048 / 100.0                      # metres -> flight level
-        issr = np.asarray(self._world.issr.mask_grid(x, y, z), dtype=bool)
+        assert self._world is not None               # callers render only after build
+        issr = np.asarray(self._world.issr.mask_grid(x, y, z), dtype=np.bool_)
         return ProfileSeries(name=flight.name, s_km=s_km, fl=fl, issr_mask=issr,
                              color=color, chosen=chosen)
 
@@ -1132,6 +1470,7 @@ class MainWindow(QMainWindow):
             f"N_total={qubo.n}\n"
             f"-> click Solve"
         )
+        self._update_dynamics_budget()  # the instance changed size
 
     def _render_conflict_graph(self, chosen: set[int]) -> None:
         n = len(self._evals)
@@ -1276,14 +1615,15 @@ class MainWindow(QMainWindow):
         base_seed = self.seed_spin.value()
         seeds = [base_seed + k for k in range(self.bench_seeds_spin.value())]
 
-        for xs, ys in self._bench_curves.values():
+        for name, (xs, ys) in self._bench_curves.items():
             xs.clear()
             ys.clear()
-        self.pasqal_curve.setData([], [])
-        self.xanadu_curve.setData([], [])
+            self._bench_curve_items[name].setData([], [])
         for row in range(self.bench_table.rowCount()):
             for col in range(1, self.bench_table.columnCount()):
                 self.bench_table.setItem(row, col, QTableWidgetItem("…"))
+        self.bench_export_csv_btn.setEnabled(False)
+        self.bench_export_png_btn.setEnabled(False)
 
         # Progress bar: 100 units per (seed, solver) cell.
         self.bench_progress.setRange(0, len(seeds) * len(SOLVER_NAMES) * 100)
@@ -1336,8 +1676,7 @@ class MainWindow(QMainWindow):
         xs, ys = self._bench_curves[solver]
         xs.append(step)
         ys.append(cost)
-        curve = self.pasqal_curve if solver == "pasqal-analog" else self.xanadu_curve
-        curve.setData(xs, ys)
+        self._bench_curve_items[solver].setData(xs, ys)
         self._bench_msg = f"{solver}  step {step}  best {cost:.1f}"
         self._refresh_bench_status()
 
@@ -1345,28 +1684,28 @@ class MainWindow(QMainWindow):
         self._bench_cells_done += 1
         self.bench_progress.setValue(self._bench_cells_done * 100)
         # CP-SAT finishing marks the start of a new instance: reset the
-        # quantum convergence curves and pin the optimum reference lines.
+        # sampler convergence curves and pin the optimum reference lines.
         if cell.solver == "cpsat":  # type: ignore[attr-defined]
-            for xs, ys in self._bench_curves.values():
+            for name, (xs, ys) in self._bench_curves.items():
                 xs.clear()
                 ys.clear()
-            self.pasqal_curve.setData([], [])
-            self.xanadu_curve.setData([], [])
+                self._bench_curve_items[name].setData([], [])
             optimum = cell.best_cost  # type: ignore[attr-defined]
             self.pasqal_opt_line.setValue(optimum)
             self.xanadu_opt_line.setValue(optimum)
             self._bench_msg = f"seed {seed}:  E* = {optimum:.1f}  (CP-SAT)"
             self._refresh_bench_status()
 
-    def _on_bench_done(self, report: object) -> None:
-        stats = report.aggregate()  # type: ignore[attr-defined]
-        instances = report.instances  # type: ignore[attr-defined]
+    def _on_bench_done(self, report: BenchmarkReport) -> None:
+        self._bench_report = report
+        stats = report.aggregate()
+        instances = report.instances
 
         # Backend / note per solver from the most recent instance.
         latest: dict[str, object] = {}
         for inst in instances:
-            for run in inst.runs:
-                latest[run.solver] = run
+            for cell_run in inst.runs:
+                latest[cell_run.solver] = cell_run
 
         means: list[float] = []
         err_low: list[float] = []
@@ -1376,12 +1715,15 @@ class MainWindow(QMainWindow):
             run = latest.get(name)
             backend = getattr(run, "backend", "-")
             if s is not None:
+                succ = "—" if math.isnan(s.success_mean) else f"{100 * s.success_mean:.1f}"
                 values = [
                     backend,
                     _mean_best_cost(instances, name),
                     f"{s.ratio_mean:.4f}",
                     f"[{s.ratio_ci_low:.4f}, {s.ratio_ci_high:.4f}]",
                     f"{100 * s.feasibility_mean:.1f}",
+                    succ,
+                    _fmt_tts_s(s.tts_median_s),
                     f"{1000 * s.wall_clock_mean_s:.0f}",
                 ]
                 means.append(s.ratio_mean)
@@ -1390,21 +1732,22 @@ class MainWindow(QMainWindow):
             else:
                 note = getattr(run, "note", "no data")
                 status = getattr(run, "status", "—")
-                values = [backend, "—", "—", "—", "—", f"{status}: {note}"]
+                values = [backend, "—", "—", "—", "—", "—", "—", f"{status}: {note}"]
                 means.append(0.0)
                 err_low.append(0.0)
                 err_high.append(0.0)
             for col, val in enumerate(values, start=1):
                 self.bench_table.setItem(row, col, QTableWidgetItem(str(val)))
 
-        # Ratio bars with bootstrap CIs.
+        # Ratio bars, one SOLVER_PENS colour per solver, with bootstrap CIs.
         if self._bench_bar_item is not None:
             self.bench_bars.removeItem(self._bench_bar_item)
         if self._bench_err_item is not None:
             self.bench_bars.removeItem(self._bench_err_item)
         x = np.arange(len(SOLVER_NAMES))
         self._bench_bar_item = pg.BarGraphItem(
-            x=x, height=means, width=0.55, brush=(80, 160, 220, 180)
+            x=x, height=means, width=0.55,
+            brushes=[pg.mkBrush(SOLVER_PENS[name]) for name in SOLVER_NAMES],
         )
         self._bench_err_item = pg.ErrorBarItem(
             x=x, y=np.array(means),
@@ -1413,18 +1756,349 @@ class MainWindow(QMainWindow):
         )
         self.bench_bars.addItem(self._bench_bar_item)
         self.bench_bars.addItem(self._bench_err_item)
-        self.bench_bars.setYRange(min(0.95, min(m for m in means if m > 0) - 0.02), 1.01)
+        positive = [m for m in means if m > 0]
+        self.bench_bars.setYRange(min(0.95, min(positive) - 0.02) if positive else 0.0, 1.01)
 
         self._bench_timer.stop()
         self.bench_progress.setValue(self.bench_progress.maximum())
+        self.bench_export_csv_btn.setEnabled(True)
+        self.bench_export_png_btn.setEnabled(True)
+        self._update_load_bo_best_state()  # G2 Load BO-best button
+        self._refresh_fingerprint_tab()  # G3 reads self._bench_report
         elapsed = int(time.monotonic() - self._bench_t0)
         n_inst = len(instances)
         self.bench_status.setText(
             f"done in {elapsed // 60}:{elapsed % 60:02d} — {n_inst} seed(s) × "
-            f"{len(SOLVER_NAMES)} solvers; green dashed line = CP-SAT optimum E* "
-            f"of the last seed"
+            f"{len(SOLVER_NAMES)} solvers; CP-SAT is the exact verifier, the rest "
+            f"are compared at matched output budget"
         )
         self.bench_btn.setEnabled(True)
+
+    def _on_export_bench_csv(self) -> None:
+        if self._bench_report is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export benchmark CSV", "", "CSV files (*.csv)")
+        if path:
+            self._bench_report.to_csv(path)
+
+    def _on_export_bench_png(self) -> None:
+        _export_plot_png(self, self.bench_bars)
+
+    # ------------------------------------------------ tab 9: quantum dynamics ---
+    def _latest_pasqal_run(self):
+        """The most recent OK pasqal-analog run with a schedule in its meta."""
+        if self._bench_report is None:
+            return None
+        latest = None
+        for inst in self._bench_report.instances:
+            run = inst.run_for("pasqal-analog")
+            if run is not None and run.status == "OK" and run.meta:
+                latest = run
+        return latest
+
+    def _update_load_bo_best_state(self) -> None:
+        self.dyn_load_btn.setEnabled(self._latest_pasqal_run() is not None)
+
+    def _update_dynamics_budget(self) -> None:
+        """Mirror the science budget guard: disable compute above 16 qubits."""
+        n = len(self._evals)
+        over = n > MAX_STATEVECTOR_QUBITS - 4  # spectral/dynamics cap is 16
+        self.dyn_btn.setEnabled(not over)
+        self.dyn_residual_btn.setEnabled(not over)
+        if over:
+            self.dyn_status.setText(f"n = {n} option qubits > 16 — reduce flights")
+        else:
+            self.dyn_status.setText(_DYN_HONESTY)
+
+    def _on_load_bo_best(self) -> None:
+        run = self._latest_pasqal_run()
+        if run is None:
+            return
+        meta = run.meta
+        self.dyn_T.setValue(float(meta.get("T_ns", self.dyn_T.value())))  # type: ignore[arg-type]
+        self.dyn_omega.setValue(
+            float(meta.get("omega_max_rad_us", self.dyn_omega.value())))  # type: ignore[arg-type]
+        self.dyn_di.setValue(
+            float(meta.get("delta_init_rad_us", self.dyn_di.value())))  # type: ignore[arg-type]
+        self.dyn_df.setValue(
+            float(meta.get("delta_final_rad_us", self.dyn_df.value())))  # type: ignore[arg-type]
+        self.dyn_status.setText("loaded the BO-best schedule from the last Pasqal run")
+
+    def _on_compute_dynamics(self) -> None:
+        if self._dyn_worker is not None and self._dyn_worker.isRunning():
+            return
+        if not self._evals:
+            self.dyn_status.setText("build an instance first (Randomize)")
+            return
+        n = len(self._evals)
+        if n > MAX_STATEVECTOR_QUBITS - 4:
+            self.dyn_status.setText(f"n = {n} option qubits > 16 — reduce flights")
+            return
+        evals, conflicts, buckets = self._evals, self._conflicts, self._buckets
+        t_ns, omega = self.dyn_T.value(), self.dyn_omega.value()
+        d_init, d_final = self.dyn_di.value(), self.dyn_df.value()
+        n_steps, n_records = self.dyn_steps.value(), self.dyn_records.value()
+
+        def job(emit):
+            from contrail_env.analysis import feasible_cost_landscape, ground_state_degeneracy
+            from contrail_env.dynamics import run_with_diagnostics
+            from contrail_env.pasqal_analog import AnnealSchedule, penalized_energy_vector
+            from contrail_env.quantum_common import build_option_graph
+            from contrail_env.spectral import instantaneous_spectrum
+
+            graph = build_option_graph(evals, conflicts, buckets)
+            schedule = AnnealSchedule(
+                T_ns=t_ns, omega_max=omega, delta_init=d_init, delta_final=d_final)
+
+            def on_phase(msg: str, frac: float) -> None:
+                emit(("phase", msg, frac))
+
+            spectrum = instantaneous_spectrum(graph, schedule, on_phase=on_phase)
+            record = run_with_diagnostics(
+                graph, schedule, n_steps=n_steps, n_records=n_records, on_phase=on_phase)
+            min_epen = float(penalized_energy_vector(graph).min())
+            try:
+                costs, _opt = feasible_cost_landscape(evals, conflicts, buckets)
+                n_ground = ground_state_degeneracy(costs, float(costs.min()))
+            except ValueError:
+                n_ground = None
+            return {
+                "spectrum": spectrum, "record": record,
+                "min_epen": min_epen, "n_ground": n_ground,
+            }
+
+        self.dyn_btn.setEnabled(False)
+        self.dyn_progress.setValue(0)
+        self.dyn_status.setText("computing spectrum + dynamics…")
+        self._dyn_worker = _AnalysisWorker(job)
+        self._dyn_worker.progress.connect(self._on_dyn_progress)
+        self._dyn_worker.done.connect(self._on_dynamics_done)
+        self._dyn_worker.failed.connect(self._on_dynamics_failed)
+        self._dyn_worker.start()
+
+    def _on_dyn_progress(self, payload) -> None:
+        if isinstance(payload, tuple) and payload and payload[0] == "phase":
+            _tag, msg, frac = payload
+            self.dyn_progress.setValue(int(100 * min(1.0, max(0.0, frac))))
+            self.dyn_status.setText(msg)
+
+    def _on_dynamics_done(self, payload) -> None:
+        self._render_dynamics(
+            payload["spectrum"], payload["record"],
+            payload.get("min_epen"), payload.get("n_ground"))
+        self.dyn_progress.setValue(100)
+        self.dyn_btn.setEnabled(True)
+        self.dyn_status.setText(_DYN_HONESTY)
+
+    def _on_dynamics_failed(self, msg: str) -> None:
+        self.dyn_btn.setEnabled(True)
+        self.dyn_status.setText(f"failed: {msg}")
+
+    def _render_dynamics(self, spectrum, record, min_epen=None, n_ground=None) -> None:
+        """Draw the 2x2 diagnostics grid + info row from plain data (no Qt in)."""
+        self._dyn_spectrum = spectrum
+        self._dyn_record = record
+
+        s = spectrum.s
+        k = spectrum.energies.shape[1]
+        for i, curve in enumerate(self._dyn_level_curves):
+            curve.setData(s, spectrum.energies[:, i]) if i < k else curve.setData([], [])
+        self._dyn_gap_curve.setData(s, spectrum.gap)
+        self.dyn_sstar_line.setValue(spectrum.s_star)
+        dmin = spectrum.delta_min
+        t_adiab = (self.dyn_omega.value() / (dmin * dmin)) * 1000.0 if dmin > 0 else float("inf")
+        self.dyn_levels_plot.setTitle(
+            f"Levels & gap — Δ_min={dmin:.3f} rad/µs @ s*={spectrum.s_star:.2f}; "
+            f"T_adiab~{t_adiab:.0f} ns vs chosen T={self.dyn_T.value():.0f} ns")
+
+        for name, curve in self._dyn_entropy_curves.items():
+            if name in record.entropies:
+                curve.setData(record.t_ns, record.entropies[name])
+            else:
+                curve.setData([], [])
+
+        self._dyn_pground_curve.setData(record.t_ns, record.p_ground)
+        self._dyn_energy_curve.setData(record.t_ns, record.energy_pen)
+        if min_epen is not None:
+            self.dyn_energy_min_line.setValue(min_epen)
+            self.dyn_energy_min_line.setVisible(True)
+        else:
+            self.dyn_energy_min_line.setVisible(False)
+
+        parts = [
+            f"Δ_min = {spectrum.delta_min:.4f}",
+            f"s* = {spectrum.s_star:.3f}",
+            f"end_degeneracy = {spectrum.end_degeneracy}",
+        ]
+        if n_ground is not None:
+            agree = "agree" if n_ground == spectrum.end_degeneracy else "differ"
+            parts.append(f"|P₀| exact = {n_ground} ({agree})")
+        else:
+            parts.append("|P₀| exact = —")
+        self.dyn_info.setText("   ".join(parts))
+
+    def _on_run_residual(self) -> None:
+        if self._dyn_residual_worker is not None and self._dyn_residual_worker.isRunning():
+            return
+        if not self._evals:
+            self.dyn_status.setText("build an instance first (Randomize)")
+            return
+        n = len(self._evals)
+        if n > MAX_STATEVECTOR_QUBITS - 4:
+            self.dyn_status.setText(f"n = {n} option qubits > 16 — reduce flights")
+            return
+        evals, conflicts, buckets = self._evals, self._conflicts, self._buckets
+        omega, d_init, d_final = self.dyn_omega.value(), self.dyn_di.value(), self.dyn_df.value()
+        n_T, n_steps = self.dyn_nT.value(), self.dyn_steps.value()
+
+        def job(emit):
+            from contrail_env.dynamics import residual_energy_vs_T
+            from contrail_env.pasqal_analog import AnnealSchedule
+            from contrail_env.quantum_common import build_option_graph
+
+            graph = build_option_graph(evals, conflicts, buckets)
+            base = AnnealSchedule(
+                T_ns=4000.0, omega_max=omega, delta_init=d_init, delta_final=d_final)
+            t_grid = np.geomspace(600.0, T_MAX_NS, n_T)
+
+            def on_phase(msg: str, frac: float) -> None:
+                emit(("phase", msg, frac))
+
+            return residual_energy_vs_T(graph, base, t_grid, n_steps=n_steps, on_phase=on_phase)
+
+        self.dyn_residual_btn.setEnabled(False)
+        self.dyn_status.setText("running ε(T) sweep…")
+        self._dyn_residual_worker = _AnalysisWorker(job)
+        self._dyn_residual_worker.progress.connect(self._on_dyn_progress)
+        self._dyn_residual_worker.done.connect(self._on_residual_done)
+        self._dyn_residual_worker.failed.connect(self._on_residual_failed)
+        self._dyn_residual_worker.start()
+
+    def _on_residual_done(self, result) -> None:
+        self._dyn_residual = result
+        self.dyn_residual_curve.setData(result.T_ns, result.residual)
+        self.dyn_residual_plot.setTitle(
+            f"Residual energy ε(T) — μ={result.mu:.3f}, R²={result.r2:.3f}")
+        self.dyn_residual_btn.setEnabled(True)
+        self.dyn_status.setText(_DYN_HONESTY)
+
+    def _on_residual_failed(self, msg: str) -> None:
+        self.dyn_residual_btn.setEnabled(True)
+        self.dyn_status.setText(f"residual sweep failed: {msg}")
+
+    def _on_export_dynamics_csv(self) -> None:
+        if self._dyn_record is None or self._dyn_spectrum is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export dynamics CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        import csv
+
+        rec, spec = self._dyn_record, self._dyn_spectrum
+        cut_names = list(rec.entropies.keys())
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["s", "t_ns", "gap", "p_ground", "energy_pen"]
+                            + [f"S_{c}" for c in cut_names])
+            for i in range(len(rec.s)):
+                writer.writerow(
+                    [rec.s[i], rec.t_ns[i], rec.gap[i], rec.p_ground[i], rec.energy_pen[i]]
+                    + [rec.entropies[c][i] for c in cut_names])
+        # Sibling levels file: s, E_0..E_{k-1}.
+        levels_path = (path[:-4] if path.endswith(".csv") else path) + "_levels.csv"
+        with open(levels_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["s"] + [f"E_{j}" for j in range(spec.energies.shape[1])])
+            for i in range(len(spec.s)):
+                writer.writerow([spec.s[i], *list(spec.energies[i])])
+        # Optional residual sweep file.
+        if self._dyn_residual is not None:
+            res_path = (path[:-4] if path.endswith(".csv") else path) + "_residual.csv"
+            with open(res_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["T_ns", "residual"])
+                for t_ns, res in zip(self._dyn_residual.T_ns, self._dyn_residual.residual,
+                                     strict=True):
+                    writer.writerow([t_ns, res])
+        self.dyn_status.setText(f"exported dynamics arrays to {path}")
+
+    def _on_export_dynamics_png(self) -> None:
+        _export_plot_png(self, self.dyn_glw)
+
+    # -------------------------------------------- tab 10: constraint fingerprint ---
+    def _refresh_fingerprint_tab(self) -> None:
+        """Render the S5 fingerprint decomposition from the last benchmark (G3).
+
+        No computation of its own — it aggregates the per-instance SolverRun
+        fingerprint means the benchmark already produced. Solvers without raw
+        samples (CP-SAT) carry NaN means and are dropped automatically.
+        """
+        report = self._bench_report
+        if report is None:
+            return
+
+        agg: dict[str, dict[str, float]] = {}
+        for name in SOLVER_NAMES:
+            per_family: dict[str, list[float]] = {f: [] for f in _FP_FAMILIES}
+            repairs: list[float] = []
+            for inst in report.instances:
+                run = inst.run_for(name)
+                if run is None or run.status != "OK" or math.isnan(run.onehot_deficit_mean):
+                    continue
+                for fam in _FP_FAMILIES:
+                    per_family[fam].append(float(getattr(run, _FP_FAMILY_ATTR[fam])))
+                repairs.append(float(run.repair_dist_mean))
+            if repairs:
+                agg[name] = {f: float(np.mean(per_family[f])) for f in _FP_FAMILIES}
+                agg[name]["repair"] = float(np.mean(repairs))
+
+        solvers = list(agg.keys())
+        if self._fp_bar_item is not None:
+            self.fp_plot.removeItem(self._fp_bar_item)
+        if self._fp_repair_item is not None:
+            self.fp_repair_plot.removeItem(self._fp_repair_item)
+
+        # Grouped bars: one BarGraphItem, four coloured bars per solver.
+        bar_w = 0.18
+        xs: list[float] = []
+        heights: list[float] = []
+        brushes: list[object] = []
+        for i, name in enumerate(solvers):
+            for j, fam in enumerate(_FP_FAMILIES):
+                xs.append(i + (j - 1.5) * bar_w)
+                heights.append(agg[name][fam])
+                brushes.append(pg.mkBrush(_FP_FAMILY_COLORS[fam]))
+        self._fp_bar_item = pg.BarGraphItem(x=xs, height=heights, width=bar_w, brushes=brushes)
+        self.fp_plot.addItem(self._fp_bar_item)
+        bottom_axis = self.fp_plot.getAxis("bottom")
+        bottom_axis.setTicks([[(i, name) for i, name in enumerate(solvers)]])
+
+        # Side: repair distance as horizontal bars, one SOLVER_PENS colour each.
+        ys = list(range(len(solvers)))
+        self._fp_repair_item = pg.BarGraphItem(
+            x0=[0.0] * len(solvers), x1=[agg[s]["repair"] for s in solvers],
+            y=ys, height=0.5,
+            brushes=[pg.mkBrush(SOLVER_PENS[s]) for s in solvers],
+        )
+        self.fp_repair_plot.addItem(self._fp_repair_item)
+        self.fp_repair_plot.getAxis("left").setTicks(
+            [[(i, name) for i, name in enumerate(solvers)]])
+
+        self._fp_rows = [(s, fam, agg[s][fam]) for s in solvers for fam in _FP_FAMILIES]
+        self.fp_export_csv_btn.setEnabled(bool(self._fp_rows))
+        self.fp_export_png_btn.setEnabled(bool(self._fp_rows))
+        self.fp_status.setText(
+            f"decomposed {len(solvers)} solver(s) over {len(report.instances)} "
+            f"instance(s); bars are means per raw pre-repair sample.")
+
+    def _on_export_fp_csv(self) -> None:
+        if not self._fp_rows:
+            return
+        rows: list[list[object]] = [[s, fam, mean] for s, fam, mean in self._fp_rows]
+        _export_rows_csv(self, ["solver", "family", "mean"], rows)
+
+    def _on_export_fp_png(self) -> None:
+        _export_plot_png(self, self.fp_plot)
 
     def _on_bench_failed(self, message: str) -> None:
         self._bench_timer.stop()
