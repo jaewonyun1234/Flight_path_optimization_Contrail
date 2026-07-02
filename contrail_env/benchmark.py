@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .classical_baselines import solve_random_repair, solve_simulated_annealing
 from .flight import EvaluatedOption
 from .options import build_and_evaluate_flight, build_random_flights
 from .pasqal_analog import solve_pasqal_analog
@@ -58,7 +59,7 @@ ResultCallback = Callable[[int, "SolverRun"], None]
 # so a GUI can prove the sweep is alive even when one BO eval takes minutes.
 PhaseCallback = Callable[[str, float], None]
 
-SOLVER_NAMES = ("cpsat", "pasqal-analog", "xanadu-gbs")
+SOLVER_NAMES = ("cpsat", "random-repair", "sa", "pasqal-analog", "xanadu-gbs")
 
 
 # =============================================================================
@@ -226,11 +227,18 @@ def _run_instance(
     cpsat_time_limit_s: float,
     pasqal_backend: str,
     xanadu_backend: str,
+    solvers: Sequence[str] | None,
     on_progress: ProgressCallback | None,
     on_result: ResultCallback | None,
     on_phase: PhaseCallback | None,
 ) -> InstanceResult:
-    """Steps 1-5 of the §10.1 protocol on one instance."""
+    """Steps 1-5 of the §10.1 protocol on one instance.
+
+    `solvers` filters the non-CP-SAT solvers (CP-SAT always runs — it defines
+    the exact optimum E*). None runs every solver in SOLVER_NAMES.
+    """
+    def enabled(name: str) -> bool:
+        return solvers is None or name in solvers
     instance = InstanceResult(
         seed=seed,
         optimum=math.nan,
@@ -275,51 +283,81 @@ def _run_instance(
     if instance.runs[0].status != "OK":
         return instance  # no ground truth -> ratios undefined; skip quantum
 
-    # --- 2. Pasqal analog-QAOA + BO ---------------------------------------
-    def pasqal_progress(step: int, cost: float) -> None:
-        if on_progress is not None:
-            on_progress("pasqal-analog", step, cost)
+    # --- 2. Classical samplers (null control + SA) ------------------------
+    # Same output budget (n_shots samples) and the same repair as the quantum
+    # pipelines, so they compete on identical footing.
+    def run_baseline(name: str, solver_fn: Callable[..., QuantumResult]) -> None:
+        def baseline_progress(step: int, cost: float) -> None:
+            if on_progress is not None:
+                on_progress(name, step, cost)
+            if on_phase is not None:
+                on_phase(
+                    f"seed {seed}: {name} sampling ({step}/{n_shots})",
+                    min(1.0, step / max(1, n_shots)),
+                )
 
-    def pasqal_phase(message: str, frac: float) -> None:
-        if on_phase is not None:
-            on_phase(f"seed {seed}: Pasqal {message}", frac)
-
-    try:
-        t0 = time.perf_counter()
-        pasqal = solve_pasqal_analog(
-            evals, conflicts, buckets,
-            n_shots=n_shots, bo_iters=bo_iters, seed=seed,
-            backend=pasqal_backend, on_progress=pasqal_progress,
-            on_phase=pasqal_phase,
-        )
-        emit(_quantum_to_run(pasqal, instance.optimum, time.perf_counter() - t0))
-    except BackendBudgetError as exc:
-        emit(SolverRun(solver="pasqal-analog", backend="-", status="SKIPPED", note=str(exc)))
-    except Exception as exc:  # surface, don't kill the sweep
-        emit(SolverRun(solver="pasqal-analog", backend="-", status="FAILED", note=str(exc)))
-
-    # --- 3. Xanadu GBS ------------------------------------------------------
-    def xanadu_progress(step: int, cost: float) -> None:
-        if on_progress is not None:
-            on_progress("xanadu-gbs", step, cost)
-        if on_phase is not None:
-            on_phase(
-                f"seed {seed}: GBS sampling {step}/{n_shots} subsets",
-                min(1.0, step / n_shots),
+        try:
+            t0 = time.perf_counter()
+            result = solver_fn(
+                evals, conflicts, buckets,
+                n_samples=n_shots, seed=seed, on_progress=baseline_progress,
             )
+            emit(_quantum_to_run(result, instance.optimum, time.perf_counter() - t0))
+        except Exception as exc:  # samplers have no budget cap, but stay defensive
+            emit(SolverRun(solver=name, backend="-", status="FAILED", note=str(exc)))
 
-    try:
-        t0 = time.perf_counter()
-        xanadu = solve_xanadu_gbs(
-            evals, conflicts, buckets,
-            n_samples=n_shots, seed=seed,
-            backend=xanadu_backend, on_progress=xanadu_progress,
-        )
-        emit(_quantum_to_run(xanadu, instance.optimum, time.perf_counter() - t0))
-    except BackendBudgetError as exc:
-        emit(SolverRun(solver="xanadu-gbs", backend="-", status="SKIPPED", note=str(exc)))
-    except Exception as exc:
-        emit(SolverRun(solver="xanadu-gbs", backend="-", status="FAILED", note=str(exc)))
+    if enabled("random-repair"):
+        run_baseline("random-repair", solve_random_repair)
+    if enabled("sa"):
+        run_baseline("sa", solve_simulated_annealing)
+
+    # --- 3. Pasqal analog-QAOA + BO ---------------------------------------
+    if enabled("pasqal-analog"):
+        def pasqal_progress(step: int, cost: float) -> None:
+            if on_progress is not None:
+                on_progress("pasqal-analog", step, cost)
+
+        def pasqal_phase(message: str, frac: float) -> None:
+            if on_phase is not None:
+                on_phase(f"seed {seed}: Pasqal {message}", frac)
+
+        try:
+            t0 = time.perf_counter()
+            pasqal = solve_pasqal_analog(
+                evals, conflicts, buckets,
+                n_shots=n_shots, bo_iters=bo_iters, seed=seed,
+                backend=pasqal_backend, on_progress=pasqal_progress,
+                on_phase=pasqal_phase,
+            )
+            emit(_quantum_to_run(pasqal, instance.optimum, time.perf_counter() - t0))
+        except BackendBudgetError as exc:
+            emit(SolverRun(solver="pasqal-analog", backend="-", status="SKIPPED", note=str(exc)))
+        except Exception as exc:  # surface, don't kill the sweep
+            emit(SolverRun(solver="pasqal-analog", backend="-", status="FAILED", note=str(exc)))
+
+    # --- 4. Xanadu GBS ------------------------------------------------------
+    if enabled("xanadu-gbs"):
+        def xanadu_progress(step: int, cost: float) -> None:
+            if on_progress is not None:
+                on_progress("xanadu-gbs", step, cost)
+            if on_phase is not None:
+                on_phase(
+                    f"seed {seed}: GBS sampling {step}/{n_shots} subsets",
+                    min(1.0, step / n_shots),
+                )
+
+        try:
+            t0 = time.perf_counter()
+            xanadu = solve_xanadu_gbs(
+                evals, conflicts, buckets,
+                n_samples=n_shots, seed=seed,
+                backend=xanadu_backend, on_progress=xanadu_progress,
+            )
+            emit(_quantum_to_run(xanadu, instance.optimum, time.perf_counter() - t0))
+        except BackendBudgetError as exc:
+            emit(SolverRun(solver="xanadu-gbs", backend="-", status="SKIPPED", note=str(exc)))
+        except Exception as exc:
+            emit(SolverRun(solver="xanadu-gbs", backend="-", status="FAILED", note=str(exc)))
 
     return instance
 
@@ -333,11 +371,14 @@ def run_benchmark(
     cpsat_time_limit_s: float = 10.0,
     pasqal_backend: str = "auto",
     xanadu_backend: str = "auto",
+    solvers: Sequence[str] | None = None,
     on_progress: ProgressCallback | None = None,
     on_result: ResultCallback | None = None,
     on_phase: PhaseCallback | None = None,
 ) -> BenchmarkReport:
     """Run the full §10.1 protocol over the given seeds.
+
+    `solvers` filters the non-CP-SAT solvers (CP-SAT always runs); None = all.
 
     Callbacks (all optional, used by the GUI):
         on_progress(solver, step, best_cost_so_far) — live convergence;
@@ -356,6 +397,7 @@ def run_benchmark(
             cpsat_time_limit_s=cpsat_time_limit_s,
             pasqal_backend=pasqal_backend,
             xanadu_backend=xanadu_backend,
+            solvers=solvers,
             on_progress=on_progress,
             on_result=on_result,
             on_phase=on_phase,
@@ -403,14 +445,21 @@ def main() -> None:
     parser.add_argument("--shots", type=int, default=1000)
     parser.add_argument("--bo-iters", type=int, default=15)
     parser.add_argument("--csv", type=str, default="", help="optional CSV output path")
+    parser.add_argument(
+        "--solvers", type=str, default="",
+        help="comma list filtering the non-CP-SAT solvers "
+             "(e.g. sa,pasqal-analog); CP-SAT always runs",
+    )
     args = parser.parse_args()
 
+    solvers = [s.strip() for s in args.solvers.split(",") if s.strip()] or None
     factory = default_scenario_factory(n_flights=args.flights)
     report = run_benchmark(
         factory,
         seeds=range(args.seeds),
         n_shots=args.shots,
         bo_iters=args.bo_iters,
+        solvers=solvers,
     )
     print(report.format_table())
     if args.csv:

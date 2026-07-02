@@ -121,6 +121,11 @@ from .xanadu_gbs import (
     solve_xanadu_gbs, strawberryfields_available,
 )
 
+# Classical sampling baselines (null control + simulated annealing)
+from .classical_baselines import (
+    solve_random_repair, solve_simulated_annealing,
+)
+
 # Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
 from .benchmark import (
     BenchmarkReport, InstanceResult, SolverRun, SolverStats,
@@ -171,6 +176,8 @@ __all__ = [
     "GBSEncoding", "GBSSubsetSampler",
     "encode_option_graph", "hafnian", "takagi_symmetric",
     "solve_xanadu_gbs", "strawberryfields_available",
+    # Classical baselines
+    "solve_random_repair", "solve_simulated_annealing",
     # Benchmark
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",
