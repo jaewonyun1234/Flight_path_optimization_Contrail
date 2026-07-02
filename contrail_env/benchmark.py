@@ -96,6 +96,10 @@ class SolverRun:
     conflict_viol_mean: float = math.nan
     capacity_overflow_mean: float = math.nan
     repair_dist_mean: float = math.nan
+    # Solver-specific parameters (QuantumResult.meta, copied verbatim). The GUI
+    # Dynamics tab reads T_ns/omega_max_rad_us/delta_init_rad_us/delta_final_rad_us
+    # off a pasqal-analog run's meta for its "Load BO-best" button.
+    meta: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -320,6 +324,7 @@ def _quantum_to_run(
         conflict_viol_mean=conflict_v,
         capacity_overflow_mean=overflow,
         repair_dist_mean=repair_dist,
+        meta=dict(result.meta),
     )
 
 
