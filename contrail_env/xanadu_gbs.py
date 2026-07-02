@@ -46,6 +46,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .fingerprint import fingerprint_to_flat_dict
 from .flight import EvaluatedOption
 from .quantum_common import (
     OptionGraph,
@@ -356,9 +357,12 @@ def solve_xanadu_gbs(
         collected: list[tuple[int, ...]] = []
 
         def on_batch(count: int) -> None:
-            # Score the batch incrementally so the GUI sees a live curve.
+            # Score the batch incrementally so the GUI sees a live curve; skip
+            # the §S5 fingerprint here (only best_cost is read, and it would
+            # re-repair every unique row on every batch).
             partial = evaluate_samples(
-                graph, (subset_to_bits(s) for s in collected[:count])
+                graph, (subset_to_bits(s) for s in collected[:count]),
+                collect_fingerprint=False,
             )
             history.append((count, partial.best_cost))
             if on_progress is not None:
@@ -389,5 +393,8 @@ def solve_xanadu_gbs(
             "max_squeezing": round(float(encoding.squeezing.max()), 3),
             "max_subset": encoding.max_subset,
             "final_sampling_wall_clock_s": final_sampling_wall_clock_s,
+            "fingerprint": (
+                fingerprint_to_flat_dict(evaluation.fingerprint) if evaluation.fingerprint else {}
+            ),
         },
     )

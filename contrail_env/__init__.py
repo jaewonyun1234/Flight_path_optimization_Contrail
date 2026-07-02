@@ -140,6 +140,11 @@ from .dynamics import (
     bipartite_entropy, default_cuts, residual_energy_vs_T, run_with_diagnostics,
 )
 
+# Constraint-violation fingerprint (raw pre-repair sample decomposition)
+from .fingerprint import (
+    Fingerprint, ViolationStats, fingerprint_bitstrings, fingerprint_to_flat_dict,
+)
+
 # Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
 from .benchmark import (
     BenchmarkReport, InstanceResult, SolverRun, SolverStats,
@@ -199,6 +204,8 @@ __all__ = [
     # Dynamics diagnostics
     "DynamicsRecord", "ResidualEnergyResult",
     "bipartite_entropy", "default_cuts", "residual_energy_vs_T", "run_with_diagnostics",
+    # Constraint fingerprint
+    "Fingerprint", "ViolationStats", "fingerprint_bitstrings", "fingerprint_to_flat_dict",
     # Benchmark
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",

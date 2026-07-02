@@ -35,10 +35,12 @@ from collections.abc import Callable
 
 import numpy as np
 
+from .fingerprint import fingerprint_to_flat_dict
 from .flight import EvaluatedOption
 from .quantum_common import (
     OptionGraph,
     QuantumResult,
+    SampleEvaluation,
     build_option_graph,
     evaluate_samples,
     make_result,
@@ -46,6 +48,10 @@ from .quantum_common import (
     repair_sample,
 )
 from .qubo import CapacityBucket, ConflictEdge
+
+
+def _fingerprint_meta(evaluation: SampleEvaluation) -> dict[str, float]:
+    return fingerprint_to_flat_dict(evaluation.fingerprint) if evaluation.fingerprint else {}
 
 
 def _repaired_cost(graph: OptionGraph, bits: np.ndarray) -> float:
@@ -120,6 +126,7 @@ def solve_random_repair(
             "n_samples": n_samples,
             "energy_evaluations": n_samples,
             "final_sampling_wall_clock_s": wall,
+            "fingerprint": _fingerprint_meta(evaluation),
         },
     )
 
@@ -290,5 +297,6 @@ def solve_simulated_annealing(
             "t_cold": round(float(t_cold), 6),
             "energy_evaluations": n_samples * n_sweeps * n,
             "final_sampling_wall_clock_s": wall,
+            "fingerprint": _fingerprint_meta(evaluation),
         },
     )

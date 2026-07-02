@@ -35,6 +35,7 @@ from typing import cast
 
 import numpy as np
 
+from .analysis import feasible_cost_landscape, ground_state_degeneracy
 from .classical_baselines import solve_random_repair, solve_simulated_annealing
 from .flight import EvaluatedOption
 from .metrics import success_probability, time_to_solution
@@ -88,6 +89,13 @@ class SolverRun:
     success_prob: float = math.nan
     tts_sample_s: float = math.nan
     tts_total_s: float = math.nan
+    # Constraint-violation fingerprint means (§S5), from the RAW pre-repair
+    # batch. NaN for CP-SAT (no raw samples) and for FAILED/SKIPPED cells.
+    onehot_deficit_mean: float = math.nan
+    onehot_excess_mean: float = math.nan
+    conflict_viol_mean: float = math.nan
+    capacity_overflow_mean: float = math.nan
+    repair_dist_mean: float = math.nan
 
 
 @dataclass
@@ -104,6 +112,10 @@ class InstanceResult:
     # objective — this is the success threshold for p_s (§S2). math.nan until
     # CP-SAT has solved.
     optimum_exact: float = math.nan
+    # Exact ground-state degeneracy (§S5), from feasible_cost_landscape; None
+    # when the instance is too large to enumerate (ValueError, small-instance
+    # tool by construction).
+    n_ground_states: int | None = None
 
     def run_for(self, solver: str) -> SolverRun | None:
         for run in self.runs:
@@ -198,7 +210,9 @@ class BenchmarkReport:
                 "seed", "solver", "backend", "status", "optimum", "optimum_exact",
                 "best_cost", "approx_ratio", "feasibility_rate",
                 "success_prob", "tts_sample_s", "tts_total_s", "wall_clock_s",
-                "n_samples", "n_options", "n_conflicts", "note",
+                "n_samples", "n_options", "n_conflicts", "n_ground_states",
+                "onehot_deficit_mean", "onehot_excess_mean", "conflict_viol_mean",
+                "capacity_overflow_mean", "repair_dist_mean", "note",
             ])
             for inst in self.instances:
                 for run in inst.runs:
@@ -210,7 +224,11 @@ class BenchmarkReport:
                         f"{run.success_prob:.6f}", f"{run.tts_sample_s:.6g}",
                         f"{run.tts_total_s:.6g}",
                         f"{run.wall_clock_s:.4f}", run.n_samples,
-                        inst.n_options, inst.n_conflicts, run.note,
+                        inst.n_options, inst.n_conflicts,
+                        "" if inst.n_ground_states is None else inst.n_ground_states,
+                        f"{run.onehot_deficit_mean:.6g}", f"{run.onehot_excess_mean:.6g}",
+                        f"{run.conflict_viol_mean:.6g}", f"{run.capacity_overflow_mean:.6g}",
+                        f"{run.repair_dist_mean:.6g}", run.note,
                     ])
 
 
@@ -273,6 +291,17 @@ def _quantum_to_run(
         t_sample_wall = cast(float, result.meta.get("final_sampling_wall_clock_s", wall_clock_s))
         tts_sample = time_to_solution(float(t_sample_wall) / n, success)
         tts_total = time_to_solution(wall_clock_s / n, success)
+
+    # §S5 constraint-violation fingerprint, from the RAW pre-repair batch.
+    deficit = excess = conflict_v = overflow = repair_dist = math.nan
+    if result.evaluation is not None and result.evaluation.fingerprint is not None:
+        fp = result.evaluation.fingerprint
+        deficit = fp.onehot_deficit.mean
+        excess = fp.onehot_excess.mean
+        conflict_v = fp.conflict.mean
+        overflow = fp.capacity_overflow.mean
+        repair_dist = fp.repair_distance.mean
+
     return SolverRun(
         solver=result.solver,
         backend=result.backend,
@@ -286,6 +315,11 @@ def _quantum_to_run(
         success_prob=success,
         tts_sample_s=tts_sample,
         tts_total_s=tts_total,
+        onehot_deficit_mean=deficit,
+        onehot_excess_mean=excess,
+        conflict_viol_mean=conflict_v,
+        capacity_overflow_mean=overflow,
+        repair_dist_mean=repair_dist,
     )
 
 
@@ -360,6 +394,14 @@ def _run_instance(
     ))
     if instance.runs[0].status != "OK":
         return instance  # no ground truth -> ratios undefined; skip quantum
+
+    # Exact ground-state degeneracy (§S5) — a small-instance tool by
+    # construction; the enumerator refuses instances it can't afford.
+    try:
+        costs, _opt = feasible_cost_landscape(evals, conflicts, buckets)
+        instance.n_ground_states = ground_state_degeneracy(costs, instance.optimum_exact)
+    except ValueError:
+        instance.n_ground_states = None
 
     # --- 2. Classical samplers (null control + SA) ------------------------
     # Same output budget (n_shots samples) and the same repair as the quantum

@@ -44,6 +44,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .bayes_opt import gp_minimize
+from .fingerprint import fingerprint_to_flat_dict
 from .flight import EvaluatedOption
 from .quantum_common import (
     BackendBudgetError,
@@ -418,9 +419,14 @@ def solve_pasqal_analog(
     iteration = 0
 
     def consume(samples: np.ndarray) -> float:
-        """Score one schedule's samples; update incumbent + history."""
+        """Score one schedule's samples; update incumbent + history.
+
+        collect_fingerprint=False: this fires once per BO probe (tuning
+        overhead) and only best_cost is read, so skip the extra repair pass
+        the §S5 fingerprint would cost here.
+        """
         nonlocal best_cost, best_indices, iteration
-        evaluation = evaluate_samples(graph, samples)
+        evaluation = evaluate_samples(graph, samples, collect_fingerprint=False)
         if evaluation.best_cost < best_cost:
             best_cost = evaluation.best_cost
             best_indices = evaluation.best_indices
@@ -523,5 +529,8 @@ def solve_pasqal_analog(
             "bo_iters": bo_iters,
             "mean_penalized_energy": round(bo.y_best, 2),
             "final_sampling_wall_clock_s": final_sampling_wall_clock_s,
+            "fingerprint": (
+                fingerprint_to_flat_dict(evaluation.fingerprint) if evaluation.fingerprint else {}
+            ),
         },
     )

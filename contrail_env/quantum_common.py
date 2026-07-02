@@ -35,11 +35,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .flight import EvaluatedOption
 from .qubo import CapacityBucket, ConflictEdge
+
+if TYPE_CHECKING:
+    # Deferred to break the quantum_common <-> fingerprint import cycle
+    # (fingerprint.py itself imports OptionGraph/repair_sample from here).
+    from .fingerprint import Fingerprint
 
 
 class BackendBudgetError(RuntimeError):
@@ -236,13 +242,23 @@ class SampleEvaluation:
     # multiplicity). Multiplicities sum to n_samples. Populated for free from
     # the dedup counts already computed in evaluate_samples.
     repaired_unique: list[tuple[tuple[int, ...], float, int]] = field(default_factory=list)
+    # Constraint-violation decomposition of the RAW (pre-repair) batch (§S5).
+    # None when collect_fingerprint=False was passed to evaluate_samples.
+    fingerprint: Fingerprint | None = None
 
 
 def evaluate_samples(
     graph: OptionGraph,
     samples: Iterable[np.ndarray],
+    *,
+    collect_fingerprint: bool = True,
 ) -> SampleEvaluation:
-    """Repair every (unique) sample and aggregate the protocol metrics."""
+    """Repair every (unique) sample and aggregate the protocol metrics.
+
+    `collect_fingerprint=False` skips the §S5 constraint-violation fingerprint
+    (which re-repairs every unique row) — pass it for cheap intermediate calls
+    (BO probes, live-convergence batches) where only best_cost is read.
+    """
     unique: dict[bytes, tuple[np.ndarray, int]] = {}
     n_total = 0
     for bits in samples:
@@ -272,6 +288,17 @@ def evaluate_samples(
             best_cost = cost
             best_indices = indices
 
+    fingerprint = None
+    if collect_fingerprint:
+        from .fingerprint import fingerprint_bitstrings
+
+        if unique:
+            rows = [np.tile(bits, (count, 1)) for bits, count in unique.values()]
+            bits_array = np.concatenate(rows, axis=0)
+        else:
+            bits_array = np.zeros((0, graph.n), dtype=np.uint8)
+        fingerprint = fingerprint_bitstrings(graph, bits_array)
+
     return SampleEvaluation(
         best_indices=best_indices,
         best_cost=best_cost,
@@ -279,6 +306,7 @@ def evaluate_samples(
         best_raw_cost=best_raw,
         n_samples=n_total,
         repaired_unique=repaired_unique,
+        fingerprint=fingerprint,
     )
 
 
