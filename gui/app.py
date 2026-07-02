@@ -40,6 +40,7 @@ PANELS
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -51,11 +52,13 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
+import pyqtgraph.exporters  # noqa: F401  (registers pg.exporters.ImageExporter)
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -83,11 +86,65 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     QWebEngineView = None  # type: ignore[assignment, misc]
     _HAS_WEBENGINE = False
 
-from contrail_env import assemble_qubo, fl_to_m, waypoints_for
-from contrail_env.benchmark import SOLVER_NAMES, run_benchmark
+from contrail_env import World, assemble_qubo, fl_to_m, waypoints_for
+from contrail_env.benchmark import SOLVER_NAMES, BenchmarkReport, run_benchmark
 from contrail_env.geo import EUROPEAN_ANCHOR
 from contrail_env.pasqal_analog import MAX_STATEVECTOR_QUBITS
 from contrail_env.scenario import ScenarioConfig, build_scenario_full, solve_scenario
+
+# One pen colour per solver, used consistently across every tab so a solver is
+# recognisable by colour alone (benchmark bars, convergence curves, fingerprint
+# bars). Keys are the SOLVER_NAMES of contrail_env.benchmark.
+SOLVER_PENS: dict[str, str] = {
+    "cpsat": "g",
+    "random-repair": "w",
+    "sa": "c",
+    "pasqal-analog": "m",
+    "xanadu-gbs": "y",
+}
+
+
+def _export_rows_csv(parent: QWidget, header: list[str], rows: list[list[object]]) -> None:
+    """Prompt for a path and write `header` + `rows` as CSV (the raw plot data)."""
+    import csv
+
+    path, _ = QFileDialog.getSaveFileName(parent, "Export CSV", "", "CSV files (*.csv)")
+    if not path:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _export_plot_png(parent: QWidget, plot: pg.PlotWidget | pg.GraphicsLayoutWidget) -> None:
+    """Prompt for a path and export a pyqtgraph plot/scene as a PNG image."""
+    path, _ = QFileDialog.getSaveFileName(parent, "Export PNG", "", "PNG image (*.png)")
+    if not path:
+        return
+    item = plot.plotItem if isinstance(plot, pg.PlotWidget) else plot.ci
+    exporter = pg.exporters.ImageExporter(item)
+    exporter.export(path)
+
+
+def _fmt_tts_s(tts_s: float) -> str:
+    """Render a TTS for a table cell: '∞' for infinite, '—' for undefined."""
+    if math.isnan(tts_s):
+        return "—"
+    if math.isinf(tts_s):
+        return "∞"
+    return f"{tts_s:.3g}s"
+
+
+def _stretch_last(table: QTableWidget, *, hide_vertical: bool = False) -> None:
+    """Stretch a table's last column (the Qt stub types the header as optional)."""
+    header = table.horizontalHeader()
+    if header is not None:
+        header.setStretchLastSection(True)
+    if hide_vertical:
+        v_header = table.verticalHeader()
+        if v_header is not None:
+            v_header.setVisible(False)
 
 # Fixed scenario knobs not exposed as controls (sensible defaults per the brief).
 CORRIDOR_FRAC = 0.05
@@ -427,6 +484,9 @@ class MainWindow(QMainWindow):
         self._worker: SolveWorker | None = None
         self._bench_worker: BenchmarkWorker | None = None
         self._pending_cfg: ScenarioConfig | None = None
+        # Last completed benchmark report — read by the exports and by the
+        # constraint-fingerprint tab (G3).
+        self._bench_report: BenchmarkReport | None = None
 
         # Research-tab workers (landscape / quantum convergence / hardness sweep).
         self._land_worker: _AnalysisWorker | None = None
@@ -446,7 +506,7 @@ class MainWindow(QMainWindow):
         self._groups: OrderedDict[str, list[int]] = OrderedDict()
         self._graph_texts: list[pg.TextItem] = []
         # World + flights kept for the geographic map panel.
-        self._world: object | None = None
+        self._world: World | None = None
         self._flights: list = []
 
         self._build_ui()
@@ -820,7 +880,7 @@ class MainWindow(QMainWindow):
         self.results.setHorizontalHeaderLabels(
             ["Flight", "Chosen opt#", "Fuel (kg)", "Contrail cells", "Disruption (FL-min)"]
         )
-        self.results.horizontalHeader().setStretchLastSection(True)
+        _stretch_last(self.results)
         return self.results
 
     def _build_benchmark_tab(self) -> QWidget:
@@ -842,10 +902,18 @@ class MainWindow(QMainWindow):
         self.bench_btn.clicked.connect(self._on_run_benchmark)
 
         self.bench_status = QLabel(
-            "idle — runs CP-SAT, Pasqal analog-QAOA, and Xanadu GBS on the "
-            "current instance over N seeds (seed, seed+1, …)"
+            "idle — CP-SAT is the exact verifier at this size; the quantum + "
+            "classical samplers are compared at matched output budget."
         )
         self.bench_status.setFont(_MONO)
+
+        # Export buttons (enabled once a report exists — G3 reads it too).
+        self.bench_export_csv_btn = QPushButton("Export CSV…")
+        self.bench_export_csv_btn.clicked.connect(self._on_export_bench_csv)
+        self.bench_export_png_btn = QPushButton("Export table PNG…")
+        self.bench_export_png_btn.clicked.connect(self._on_export_bench_png)
+        self.bench_export_csv_btn.setEnabled(False)
+        self.bench_export_png_btn.setEnabled(False)
 
         # Overall sweep progress: 100 units per (seed, solver) cell, with the
         # heartbeat filling the current cell fractionally — so the bar moves
@@ -870,16 +938,18 @@ class MainWindow(QMainWindow):
             controls.addWidget(widget)
         controls.addWidget(self.bench_btn)
         controls.addWidget(self.bench_progress)
+        controls.addWidget(self.bench_export_csv_btn)
+        controls.addWidget(self.bench_export_png_btn)
         controls.addWidget(self.bench_status, stretch=1)
 
         # --- aggregate table ---------------------------------------------------
-        self.bench_table = QTableWidget(len(SOLVER_NAMES), 7)
-        self.bench_table.setHorizontalHeaderLabels([
-            "Solver", "Backend", "E_best (mean)", "Approx ratio r",
-            "r 95% CI", "Raw feas %", "Wall (ms)",
-        ])
-        self.bench_table.horizontalHeader().setStretchLastSection(True)
-        self.bench_table.verticalHeader().setVisible(False)
+        self.bench_columns = [
+            "Solver", "Backend", "E_best (mean)", "Approx ratio r", "r 95% CI",
+            "Raw feas %", "Succ %", "TTS99 (med)", "Wall (ms)",
+        ]
+        self.bench_table = QTableWidget(len(SOLVER_NAMES), len(self.bench_columns))
+        self.bench_table.setHorizontalHeaderLabels(self.bench_columns)
+        _stretch_last(self.bench_table, hide_vertical=True)
         for row, name in enumerate(SOLVER_NAMES):
             self.bench_table.setItem(row, 0, QTableWidgetItem(name))
 
@@ -909,14 +979,23 @@ class MainWindow(QMainWindow):
         )
         self.pasqal_plot.addItem(self.pasqal_opt_line)
 
+        # Xanadu GBS + the classical SA baseline share this "cost vs samples"
+        # plot (both stream best-cost-so-far against sample count); colour tells
+        # them apart via SOLVER_PENS.
         self.xanadu_plot = pg.PlotWidget(
-            title="Xanadu GBS — best repaired cost vs samples"
+            title="Samplers — best repaired cost vs samples (Xanadu GBS + SA baseline)"
         )
         self.xanadu_plot.setLabel("bottom", "samples drawn")
         self.xanadu_plot.setLabel("left", "best combined cost")
         self.xanadu_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.xanadu_plot.addLegend()
         self.xanadu_curve = self.xanadu_plot.plot(
-            [], [], pen=pg.mkPen("y", width=2), symbol="o", symbolSize=6
+            [], [], pen=pg.mkPen(SOLVER_PENS["xanadu-gbs"], width=2),
+            symbol="o", symbolSize=6, name="Xanadu GBS",
+        )
+        self.sa_curve = self.xanadu_plot.plot(
+            [], [], pen=pg.mkPen(SOLVER_PENS["sa"], width=2),
+            symbol="t", symbolSize=6, name="SA baseline",
         )
         self.xanadu_opt_line = pg.InfiniteLine(
             angle=0, pen=pg.mkPen("g", style=Qt.PenStyle.DashLine)
@@ -926,6 +1005,12 @@ class MainWindow(QMainWindow):
         self._bench_curves: dict[str, tuple[list[int], list[float]]] = {
             "pasqal-analog": ([], []),
             "xanadu-gbs": ([], []),
+            "sa": ([], []),
+        }
+        self._bench_curve_items = {
+            "pasqal-analog": self.pasqal_curve,
+            "xanadu-gbs": self.xanadu_curve,
+            "sa": self.sa_curve,
         }
 
         # --- layout ---------------------------------------------------------
@@ -1024,7 +1109,8 @@ class MainWindow(QMainWindow):
         z = np.array([w[2] for w in wps], dtype=float)
         s_km = np.hypot(x - x[0], y - y[0])          # distance flown from origin
         fl = z / 0.3048 / 100.0                      # metres -> flight level
-        issr = np.asarray(self._world.issr.mask_grid(x, y, z), dtype=bool)
+        assert self._world is not None               # callers render only after build
+        issr = np.asarray(self._world.issr.mask_grid(x, y, z), dtype=np.bool_)
         return ProfileSeries(name=flight.name, s_km=s_km, fl=fl, issr_mask=issr,
                              color=color, chosen=chosen)
 
@@ -1276,14 +1362,15 @@ class MainWindow(QMainWindow):
         base_seed = self.seed_spin.value()
         seeds = [base_seed + k for k in range(self.bench_seeds_spin.value())]
 
-        for xs, ys in self._bench_curves.values():
+        for name, (xs, ys) in self._bench_curves.items():
             xs.clear()
             ys.clear()
-        self.pasqal_curve.setData([], [])
-        self.xanadu_curve.setData([], [])
+            self._bench_curve_items[name].setData([], [])
         for row in range(self.bench_table.rowCount()):
             for col in range(1, self.bench_table.columnCount()):
                 self.bench_table.setItem(row, col, QTableWidgetItem("…"))
+        self.bench_export_csv_btn.setEnabled(False)
+        self.bench_export_png_btn.setEnabled(False)
 
         # Progress bar: 100 units per (seed, solver) cell.
         self.bench_progress.setRange(0, len(seeds) * len(SOLVER_NAMES) * 100)
@@ -1336,8 +1423,7 @@ class MainWindow(QMainWindow):
         xs, ys = self._bench_curves[solver]
         xs.append(step)
         ys.append(cost)
-        curve = self.pasqal_curve if solver == "pasqal-analog" else self.xanadu_curve
-        curve.setData(xs, ys)
+        self._bench_curve_items[solver].setData(xs, ys)
         self._bench_msg = f"{solver}  step {step}  best {cost:.1f}"
         self._refresh_bench_status()
 
@@ -1345,28 +1431,28 @@ class MainWindow(QMainWindow):
         self._bench_cells_done += 1
         self.bench_progress.setValue(self._bench_cells_done * 100)
         # CP-SAT finishing marks the start of a new instance: reset the
-        # quantum convergence curves and pin the optimum reference lines.
+        # sampler convergence curves and pin the optimum reference lines.
         if cell.solver == "cpsat":  # type: ignore[attr-defined]
-            for xs, ys in self._bench_curves.values():
+            for name, (xs, ys) in self._bench_curves.items():
                 xs.clear()
                 ys.clear()
-            self.pasqal_curve.setData([], [])
-            self.xanadu_curve.setData([], [])
+                self._bench_curve_items[name].setData([], [])
             optimum = cell.best_cost  # type: ignore[attr-defined]
             self.pasqal_opt_line.setValue(optimum)
             self.xanadu_opt_line.setValue(optimum)
             self._bench_msg = f"seed {seed}:  E* = {optimum:.1f}  (CP-SAT)"
             self._refresh_bench_status()
 
-    def _on_bench_done(self, report: object) -> None:
-        stats = report.aggregate()  # type: ignore[attr-defined]
-        instances = report.instances  # type: ignore[attr-defined]
+    def _on_bench_done(self, report: BenchmarkReport) -> None:
+        self._bench_report = report
+        stats = report.aggregate()
+        instances = report.instances
 
         # Backend / note per solver from the most recent instance.
         latest: dict[str, object] = {}
         for inst in instances:
-            for run in inst.runs:
-                latest[run.solver] = run
+            for cell_run in inst.runs:
+                latest[cell_run.solver] = cell_run
 
         means: list[float] = []
         err_low: list[float] = []
@@ -1376,12 +1462,15 @@ class MainWindow(QMainWindow):
             run = latest.get(name)
             backend = getattr(run, "backend", "-")
             if s is not None:
+                succ = "—" if math.isnan(s.success_mean) else f"{100 * s.success_mean:.1f}"
                 values = [
                     backend,
                     _mean_best_cost(instances, name),
                     f"{s.ratio_mean:.4f}",
                     f"[{s.ratio_ci_low:.4f}, {s.ratio_ci_high:.4f}]",
                     f"{100 * s.feasibility_mean:.1f}",
+                    succ,
+                    _fmt_tts_s(s.tts_median_s),
                     f"{1000 * s.wall_clock_mean_s:.0f}",
                 ]
                 means.append(s.ratio_mean)
@@ -1390,21 +1479,22 @@ class MainWindow(QMainWindow):
             else:
                 note = getattr(run, "note", "no data")
                 status = getattr(run, "status", "—")
-                values = [backend, "—", "—", "—", "—", f"{status}: {note}"]
+                values = [backend, "—", "—", "—", "—", "—", "—", f"{status}: {note}"]
                 means.append(0.0)
                 err_low.append(0.0)
                 err_high.append(0.0)
             for col, val in enumerate(values, start=1):
                 self.bench_table.setItem(row, col, QTableWidgetItem(str(val)))
 
-        # Ratio bars with bootstrap CIs.
+        # Ratio bars, one SOLVER_PENS colour per solver, with bootstrap CIs.
         if self._bench_bar_item is not None:
             self.bench_bars.removeItem(self._bench_bar_item)
         if self._bench_err_item is not None:
             self.bench_bars.removeItem(self._bench_err_item)
         x = np.arange(len(SOLVER_NAMES))
         self._bench_bar_item = pg.BarGraphItem(
-            x=x, height=means, width=0.55, brush=(80, 160, 220, 180)
+            x=x, height=means, width=0.55,
+            brushes=[pg.mkBrush(SOLVER_PENS[name]) for name in SOLVER_NAMES],
         )
         self._bench_err_item = pg.ErrorBarItem(
             x=x, y=np.array(means),
@@ -1413,18 +1503,35 @@ class MainWindow(QMainWindow):
         )
         self.bench_bars.addItem(self._bench_bar_item)
         self.bench_bars.addItem(self._bench_err_item)
-        self.bench_bars.setYRange(min(0.95, min(m for m in means if m > 0) - 0.02), 1.01)
+        positive = [m for m in means if m > 0]
+        self.bench_bars.setYRange(min(0.95, min(positive) - 0.02) if positive else 0.0, 1.01)
 
         self._bench_timer.stop()
         self.bench_progress.setValue(self.bench_progress.maximum())
+        self.bench_export_csv_btn.setEnabled(True)
+        self.bench_export_png_btn.setEnabled(True)
+        self._refresh_fingerprint_tab()  # G3 reads self._bench_report
         elapsed = int(time.monotonic() - self._bench_t0)
         n_inst = len(instances)
         self.bench_status.setText(
             f"done in {elapsed // 60}:{elapsed % 60:02d} — {n_inst} seed(s) × "
-            f"{len(SOLVER_NAMES)} solvers; green dashed line = CP-SAT optimum E* "
-            f"of the last seed"
+            f"{len(SOLVER_NAMES)} solvers; CP-SAT is the exact verifier, the rest "
+            f"are compared at matched output budget"
         )
         self.bench_btn.setEnabled(True)
+
+    def _on_export_bench_csv(self) -> None:
+        if self._bench_report is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export benchmark CSV", "", "CSV files (*.csv)")
+        if path:
+            self._bench_report.to_csv(path)
+
+    def _on_export_bench_png(self) -> None:
+        _export_plot_png(self, self.bench_bars)
+
+    def _refresh_fingerprint_tab(self) -> None:
+        """Populated by the constraint-fingerprint tab (G3); no-op until then."""
 
     def _on_bench_failed(self, message: str) -> None:
         self._bench_timer.stop()
