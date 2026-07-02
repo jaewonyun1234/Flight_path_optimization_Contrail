@@ -166,6 +166,16 @@ class RydbergStatevector:
         self._detune_load = detune_load
         self._inter = inter
 
+    @property
+    def interaction_diag(self) -> np.ndarray:
+        """Read-only U·#edges-on(z) per basis state — reused by spectral.py."""
+        return self._inter
+
+    @property
+    def detune_load(self) -> np.ndarray:
+        """Read-only sum_i u_i·bit_i(z) per basis state — reused by spectral.py."""
+        return self._detune_load
+
     def run(
         self,
         schedule: AnnealSchedule,

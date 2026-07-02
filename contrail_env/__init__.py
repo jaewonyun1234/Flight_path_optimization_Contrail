@@ -129,6 +129,11 @@ from .classical_baselines import (
 # Per-shot benchmark statistics (success probability + time-to-solution)
 from .metrics import success_probability, time_to_solution
 
+# Instantaneous spectrum of the analog sweep (adiabaticity diagnostic)
+from .spectral import (
+    AnalogSpectrum, hamiltonian_matvec, instantaneous_spectrum, lowest_eigenpairs,
+)
+
 # Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
 from .benchmark import (
     BenchmarkReport, InstanceResult, SolverRun, SolverStats,
@@ -183,6 +188,8 @@ __all__ = [
     "solve_random_repair", "solve_simulated_annealing",
     # Per-shot metrics
     "success_probability", "time_to_solution",
+    # Spectral diagnostics
+    "AnalogSpectrum", "hamiltonian_matvec", "instantaneous_spectrum", "lowest_eigenpairs",
     # Benchmark
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",
