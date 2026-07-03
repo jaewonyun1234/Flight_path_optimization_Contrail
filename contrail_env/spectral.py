@@ -56,6 +56,9 @@ class AnalogSpectrum:
         end_degeneracy: #{k : E_k(s_last) - E_0(s_last) < deg_tol} at s = last
         n:              number of qubits
         k:              number of eigenvalues actually returned
+        s_star_at_boundary: True when s* is the first/last scanned point, so the
+                        true minimum may lie outside the window and delta_min /
+                        s* are lower-bound estimates, not interior minima
     """
 
     s: np.ndarray
@@ -66,6 +69,7 @@ class AnalogSpectrum:
     end_degeneracy: int
     n: int
     k: int
+    s_star_at_boundary: bool = False
 
 
 def hamiltonian_matvec(psi: np.ndarray, diag: np.ndarray, omega: float, n: int) -> np.ndarray:
@@ -156,6 +160,17 @@ def lowest_eigenpairs(
     return (w[:k_eff], v[:, :k_eff] if return_vectors else None)
 
 
+def _argmin_at_boundary(gap: np.ndarray) -> bool:
+    """True if the gap's minimum sits at the first or last scanned point.
+
+    A boundary argmin means the true delta_min may lie outside the scan window
+    (e.g. when delta_final leaves the classical gap shrinking monotonically into
+    the endpoint), so the reported delta_min / s* are then lower-bound estimates.
+    """
+    i = int(np.argmin(gap))
+    return i == 0 or i == gap.shape[0] - 1
+
+
 def instantaneous_spectrum(
     graph: OptionGraph,
     schedule: AnnealSchedule,
@@ -221,4 +236,7 @@ def instantaneous_spectrum(
         end_degeneracy=end_degeneracy,
         n=n,
         k=k_eff,
+        # Flag on `search` (the interior-masked array s* is drawn from), so the
+        # boundary check stays consistent with the reported s_star.
+        s_star_at_boundary=_argmin_at_boundary(search),
     )

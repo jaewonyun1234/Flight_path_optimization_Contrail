@@ -10,7 +10,11 @@ import pytest
 
 from contrail_env.pasqal_analog import AnnealSchedule, RydbergStatevector
 from contrail_env.quantum_common import BackendBudgetError, OptionGraph
-from contrail_env.spectral import hamiltonian_matvec, instantaneous_spectrum
+from contrail_env.spectral import (
+    _argmin_at_boundary,
+    hamiltonian_matvec,
+    instantaneous_spectrum,
+)
 
 _SCHED = AnnealSchedule(T_ns=4000.0, omega_max=10.0, delta_init=-8.0, delta_final=8.0)
 
@@ -84,6 +88,13 @@ def test_budget_guard():
         instantaneous_spectrum(huge, _SCHED, s_grid=np.array([0.5]), k=4, allow_large=True)
 
 
+def test_argmin_at_boundary():
+    # Interior minimum -> False; a minimum at either end -> True.
+    assert _argmin_at_boundary(np.array([2.0, 1.0, 0.5, 1.0, 2.0])) is False
+    assert _argmin_at_boundary(np.array([0.1, 1.0, 2.0, 3.0])) is True
+    assert _argmin_at_boundary(np.array([3.0, 2.0, 1.0, 0.2])) is True
+
+
 def test_gap_curve_single_interior_minimum():
     graph = _graph(6, [2.0, 5.0, 1.0, 4.0, 3.0, 6.0],
                    {"A": (0, 1, 2), "B": (3, 4, 5)}, conflict_edges=((0, 3),))
@@ -92,3 +103,5 @@ def test_gap_curve_single_interior_minimum():
     assert 0.0 < spec.s_star < 1.0
     assert spec.delta_min == pytest.approx(spec.gap.min(), abs=1e-12)
     assert spec.end_degeneracy >= 1
+    # P4: the boundary flag is present and boolean.
+    assert isinstance(spec.s_star_at_boundary, bool)

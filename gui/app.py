@@ -1938,9 +1938,14 @@ class MainWindow(QMainWindow):
         else:
             self.dyn_energy_min_line.setVisible(False)
 
+        s_star_txt = f"s* = {spectrum.s_star:.3f}"
+        if spectrum.s_star_at_boundary:
+            # The min sits at the scan edge — Δ_min is a lower bound, not an
+            # interior minimum; flag it so it isn't read as the true gap.
+            s_star_txt += " (scan boundary)"
         parts = [
             f"Δ_min = {spectrum.delta_min:.4f}",
-            f"s* = {spectrum.s_star:.3f}",
+            s_star_txt,
             f"end_degeneracy = {spectrum.end_degeneracy}",
         ]
         if n_ground is not None:
