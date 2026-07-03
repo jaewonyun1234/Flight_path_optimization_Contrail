@@ -1,5 +1,6 @@
 """Benchmark protocol: one tiny sweep end-to-end, plus the statistics."""
 
+import csv
 import math
 
 from contrail_env import (
@@ -8,6 +9,10 @@ from contrail_env import (
     run_benchmark,
 )
 from contrail_env.benchmark import SOLVER_NAMES
+
+# Columns that legitimately vary run-to-run: TTS ∝ t_shot is a wall-clock-
+# derived quantity (Rønnow et al. 2014), so it tracks machine load, not physics.
+_TIMING_COLUMNS = {"wall_clock_s", "tts_sample_s", "tts_total_s"}
 
 
 def test_benchmark_one_seed_all_solvers(tmp_path):
@@ -59,6 +64,34 @@ def test_benchmark_one_seed_all_solvers(tmp_path):
     report.to_csv(str(csv_path))
     content = csv_path.read_text(encoding="utf-8")
     assert content.count("\n") == 1 + len(SOLVER_NAMES)  # header + 3 rows
+
+
+def test_determinism_science_columns(tmp_path):
+    """Two identical-seed runs → byte-identical science columns in the CSV.
+
+    Only the three timing-derived columns may differ (see _TIMING_COLUMNS).
+    Micro scale so both runs finish well under a minute.
+    """
+    factory = default_scenario_factory(n_flights=3)
+    kw = dict(seeds=[0], n_shots=120, bo_iters=3, cpsat_time_limit_s=2.0)
+
+    rows_per_run: list[list[dict[str, str]]] = []
+    for i in range(2):
+        report = run_benchmark(factory, **kw)
+        path = tmp_path / f"run{i}.csv"
+        report.to_csv(str(path))
+        rows_per_run.append(
+            list(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+        )
+
+    rows_a, rows_b = rows_per_run
+    assert rows_a and len(rows_a) == len(rows_b)
+    for ra, rb in zip(rows_a, rows_b, strict=True):
+        assert ra.keys() == rb.keys()
+        for col in ra:
+            if col in _TIMING_COLUMNS:
+                continue
+            assert ra[col] == rb[col], f"non-deterministic science column {col!r}"
 
 
 def test_bootstrap_ci_brackets_mean():

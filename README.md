@@ -49,6 +49,17 @@ The benchmark also runs headless:
 python -m contrail_env.benchmark --flights 4 --seeds 5 --csv results.csv
 ```
 
+## Reproducibility
+
+Every sampler is seeded, so two benchmark runs with the same seeds produce
+**byte-identical scientific columns** in the CSV — costs, approximation ratios,
+feasibility and success rates, and the constraint-fingerprint means all match
+exactly. The only columns that legitimately vary between runs are the three
+timing-derived ones (`wall_clock_s`, `tts_sample_s`, `tts_total_s`): time-to-
+solution is a wall-clock-derived quantity (TTS ∝ t_shot, Rønnow et al. 2014),
+so it tracks machine load rather than the physics. This contract is enforced by
+`tests/test_benchmark.py::test_determinism_science_columns`.
+
 ## ISSR field
 
 The airspace's contrail zones (ice-supersaturated regions) are synthetic
