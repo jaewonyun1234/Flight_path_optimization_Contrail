@@ -1142,6 +1142,9 @@ class MainWindow(QMainWindow):
         self.dyn_glw = pg.GraphicsLayoutWidget()
         self.dyn_levels_plot = self.dyn_glw.addPlot(row=0, col=0, title="Levels & gap")
         self.dyn_levels_plot.setLabel("bottom", "s = t/T")
+        # s = t/T is a bare ratio in [0, 1]; without this an empty autoranged
+        # axis renders a spurious SI prefix ("s = t/T (x0.001)").
+        self.dyn_levels_plot.getAxis("bottom").enableAutoSIPrefix(False)
         self.dyn_levels_plot.setLabel("left", "energy (rad/µs)")
         self.dyn_levels_plot.showGrid(x=True, y=True, alpha=0.3)
         self._dyn_level_curves = [
@@ -1185,14 +1188,26 @@ class MainWindow(QMainWindow):
         self.dyn_energy_min_line.setVisible(False)
         self.dyn_energy_plot.addItem(self.dyn_energy_min_line)
 
-        # Residual-energy sweep plot (log-log).
-        self.dyn_residual_plot = pg.PlotWidget(title="Residual energy ε(T) — run the sweep")
-        self.dyn_residual_plot.setLabel("bottom", "T (ns)")
-        self.dyn_residual_plot.setLabel("left", "ε(T)")
-        self.dyn_residual_plot.setLogMode(x=True, y=True)
-        self.dyn_residual_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.dyn_residual_curve = self.dyn_residual_plot.plot(
+        # Residual-energy sweep (log-log) lives on the SAME canvas as a third
+        # column spanning both rows — a separate side widget got squeezed to a
+        # sliver when the window was maximised and was missing from PNG exports.
+        self.dyn_resid = self.dyn_glw.addPlot(
+            row=0, col=2, rowspan=2, title="Residual energy ε(T)")
+        self.dyn_resid.setLabel("bottom", "T (ns)")
+        self.dyn_resid.setLabel("left", "ε(T)")
+        self.dyn_resid.setLogMode(x=True, y=True)
+        self.dyn_resid.showGrid(x=True, y=True, alpha=0.3)
+        self.dyn_residual_curve = self.dyn_resid.plot(
             [], [], pen=pg.mkPen("y", width=2), symbol="o", symbolSize=6)
+
+        # Explicit column geometry (ci.layout is a QGraphicsGridLayout): the two
+        # 2x2 diagnostic columns split the stretch evenly; the residual column
+        # keeps a floor width so its title can't truncate.
+        lay = self.dyn_glw.ci.layout
+        lay.setColumnStretchFactor(0, 3)
+        lay.setColumnStretchFactor(1, 3)
+        lay.setColumnStretchFactor(2, 2)
+        lay.setColumnMinimumWidth(2, 260)
 
         self.dyn_info = QLabel("Δ_min: —   s*: —   end_degeneracy: —   |P₀| exact: —")
         self.dyn_info.setFont(_MONO)
@@ -1200,16 +1215,10 @@ class MainWindow(QMainWindow):
         self.dyn_status.setFont(_MONO)
         self.dyn_status.setWordWrap(True)
 
-        plots_row = QHBoxLayout()
-        plots_row.addWidget(self.dyn_glw, stretch=3)
-        plots_row.addWidget(self.dyn_residual_plot, stretch=1)
-        plots_w = QWidget()
-        plots_w.setLayout(plots_row)
-
         root = QVBoxLayout()
         root.addLayout(controls)
         root.addLayout(controls2)
-        root.addWidget(plots_w, stretch=1)
+        root.addWidget(self.dyn_glw, stretch=1)
         root.addWidget(self.dyn_info)
         root.addWidget(self.dyn_status)
         wrap = QWidget()
@@ -1225,7 +1234,12 @@ class MainWindow(QMainWindow):
         self.fp_export_png_btn.clicked.connect(self._on_export_fp_png)
         self.fp_export_png_btn.setEnabled(False)
 
-        self.fp_plot = pg.PlotWidget(
+        # Both panels share ONE canvas so a single Export PNG captures both and
+        # neither gets squeezed: wide grouped violation bars at col 0, the
+        # horizontal repair-distance bars in a fixed-floor side column at col 1.
+        self.fp_glw = pg.GraphicsLayoutWidget()
+        self.fp_plot = self.fp_glw.addPlot(
+            row=0, col=0,
             title="Raw-sample constraint violations, per family (pre-repair)")
         self.fp_plot.setLabel("left", "mean violations per raw sample")
         self.fp_plot.showGrid(y=True, alpha=0.3)
@@ -1238,11 +1252,16 @@ class MainWindow(QMainWindow):
             self._fp_legend.addItem(proxy, fam)
         self._fp_bar_item: pg.BarGraphItem | None = None
 
-        self.fp_repair_plot = pg.PlotWidget(
-            title="Repair distance per solver (how far repair moved each platform's samples)")
-        self.fp_repair_plot.setLabel("bottom", "mean Hamming distance to repaired")
-        self.fp_repair_plot.showGrid(x=True, alpha=0.3)
+        # Short title so it can't truncate in the narrow side column.
+        self.fp_repair = self.fp_glw.addPlot(row=0, col=1, title="Repair distance d̄_H")
+        self.fp_repair.setLabel("bottom", "mean Hamming distance to repaired")
+        self.fp_repair.showGrid(x=True, alpha=0.3)
         self._fp_repair_item: pg.BarGraphItem | None = None
+
+        lay = self.fp_glw.ci.layout
+        lay.setColumnStretchFactor(0, 3)
+        lay.setColumnStretchFactor(1, 1)
+        lay.setColumnMinimumWidth(1, 240)
 
         self.fp_info = QLabel()
         self.fp_info.setTextFormat(Qt.TextFormat.RichText)
@@ -1271,15 +1290,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.fp_export_csv_btn)
         controls.addWidget(self.fp_export_png_btn)
 
-        plots = QHBoxLayout()
-        plots.addWidget(self.fp_plot, stretch=3)
-        plots.addWidget(self.fp_repair_plot, stretch=1)
-        plots_w = QWidget()
-        plots_w.setLayout(plots)
-
         root = QVBoxLayout()
         root.addLayout(controls)
-        root.addWidget(plots_w, stretch=1)
+        root.addWidget(self.fp_glw, stretch=1)
         root.addWidget(self.fp_info)
         root.addWidget(self.fp_status)
         wrap = QWidget()
@@ -1977,7 +1990,7 @@ class MainWindow(QMainWindow):
     def _on_residual_done(self, result) -> None:
         self._dyn_residual = result
         self.dyn_residual_curve.setData(result.T_ns, result.residual)
-        self.dyn_residual_plot.setTitle(
+        self.dyn_resid.setTitle(
             f"Residual energy ε(T) — μ={result.mu:.3f}, R²={result.r2:.3f}")
         self.dyn_residual_btn.setEnabled(True)
         self.dyn_status.setText(_DYN_HONESTY)
@@ -2056,7 +2069,7 @@ class MainWindow(QMainWindow):
         if self._fp_bar_item is not None:
             self.fp_plot.removeItem(self._fp_bar_item)
         if self._fp_repair_item is not None:
-            self.fp_repair_plot.removeItem(self._fp_repair_item)
+            self.fp_repair.removeItem(self._fp_repair_item)
 
         # Grouped bars: one BarGraphItem, four coloured bars per solver.
         bar_w = 0.18
@@ -2080,8 +2093,8 @@ class MainWindow(QMainWindow):
             y=ys, height=0.5,
             brushes=[pg.mkBrush(SOLVER_PENS[s]) for s in solvers],
         )
-        self.fp_repair_plot.addItem(self._fp_repair_item)
-        self.fp_repair_plot.getAxis("left").setTicks(
+        self.fp_repair.addItem(self._fp_repair_item)
+        self.fp_repair.getAxis("left").setTicks(
             [[(i, name) for i, name in enumerate(solvers)]])
 
         self._fp_rows = [(s, fam, agg[s][fam]) for s in solvers for fam in _FP_FAMILIES]
@@ -2098,7 +2111,7 @@ class MainWindow(QMainWindow):
         _export_rows_csv(self, ["solver", "family", "mean"], rows)
 
     def _on_export_fp_png(self) -> None:
-        _export_plot_png(self, self.fp_plot)
+        _export_plot_png(self, self.fp_glw)
 
     def _on_bench_failed(self, message: str) -> None:
         self._bench_timer.stop()

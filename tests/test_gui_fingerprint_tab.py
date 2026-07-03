@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest  # noqa: E402
 
 pytest.importorskip("PyQt6")
-pytest.importorskip("pyqtgraph")
+pyqtgraph = pytest.importorskip("pyqtgraph")
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
@@ -58,6 +58,15 @@ def _report_with_fingerprints() -> BenchmarkReport:
     report = BenchmarkReport()
     report.instances.append(inst)
     return report
+
+
+def test_canvas_holds_two_panels(qapp):
+    # P1b: grouped violation bars + repair-distance bars share one canvas, so a
+    # single Export PNG captures both panels.
+    win = MainWindow()
+    panels = [it for it in win.fp_glw.ci.items if isinstance(it, pyqtgraph.PlotItem)]
+    assert len(panels) == 2
+    assert win.fp_repair in panels
 
 
 def test_placeholder_before_any_report(qapp):

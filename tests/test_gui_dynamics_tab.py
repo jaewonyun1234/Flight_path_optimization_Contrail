@@ -14,7 +14,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 pytest.importorskip("PyQt6")
-pytest.importorskip("pyqtgraph")
+pyqtgraph = pytest.importorskip("pyqtgraph")
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
@@ -47,6 +47,15 @@ def _synthetic():
         cuts={"flights_half": (0,), "index_half": (0,)},
     )
     return spectrum, record
+
+
+def test_canvas_holds_five_panels(qapp):
+    # P1a: the residual ε(T) plot was merged into the main canvas (col 2,
+    # rowspan 2), so one Export PNG now captures all five panels.
+    win = MainWindow()
+    panels = [it for it in win.dyn_glw.ci.items if isinstance(it, pyqtgraph.PlotItem)]
+    assert len(panels) == 5
+    assert win.dyn_resid in panels
 
 
 def test_render_populates_four_cells(qapp):
