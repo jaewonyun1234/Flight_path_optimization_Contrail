@@ -44,6 +44,8 @@ USAGE PATTERN
     z_opt, cost_opt, energy_opt = brute_force_optimum(qubo, all_evals)
 """
 
+from typing import Any
+
 # Units
 from .units import (
     M_PER_FT, FT_PER_M, M_PER_NM, NM_PER_KM,
@@ -145,11 +147,12 @@ from .fingerprint import (
     Fingerprint, ViolationStats, fingerprint_bitstrings, fingerprint_to_flat_dict,
 )
 
-# Benchmark protocol (CP-SAT vs Pasqal vs Xanadu)
-from .benchmark import (
-    BenchmarkReport, InstanceResult, SolverRun, SolverStats,
-    run_benchmark, default_scenario_factory, bootstrap_ci,
-)
+# Benchmark protocol (CP-SAT vs Pasqal vs Xanadu) — imported LAZILY via the
+# PEP 562 __getattr__ below (see the note there), not eagerly here.
+_BENCHMARK_EXPORTS = frozenset({
+    "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
+    "run_benchmark", "default_scenario_factory", "bootstrap_ci",
+})
 
 __all__ = [
     # Units
@@ -210,3 +213,19 @@ __all__ = [
     "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
     "run_benchmark", "default_scenario_factory", "bootstrap_ci",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily re-export the benchmark symbols (PEP 562).
+
+    Importing `.benchmark` eagerly at package-import time put it in
+    `sys.modules` before `python -m contrail_env.benchmark` could execute it
+    as `__main__`, so runpy emitted a RuntimeWarning ("found in sys.modules …
+    prior to execution"). Deferring the import to first attribute access keeps
+    the public API identical (`from contrail_env import run_benchmark` still
+    works) without the pre-import.
+    """
+    if name in _BENCHMARK_EXPORTS:
+        from . import benchmark
+        return getattr(benchmark, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

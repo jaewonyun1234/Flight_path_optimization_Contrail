@@ -2,13 +2,16 @@
 
 import csv
 import math
+import warnings
+
+import pytest
 
 from contrail_env import (
     bootstrap_ci,
     default_scenario_factory,
     run_benchmark,
 )
-from contrail_env.benchmark import SOLVER_NAMES
+from contrail_env.benchmark import SOLVER_NAMES, _tts_median_iqr
 
 # Columns that legitimately vary run-to-run: TTS ∝ t_shot is a wall-clock-
 # derived quantity (Rønnow et al. 2014), so it tracks machine load, not physics.
@@ -92,6 +95,31 @@ def test_determinism_science_columns(tmp_path):
             if col in _TIMING_COLUMNS:
                 continue
             assert ra[col] == rb[col], f"non-deterministic science column {col!r}"
+
+
+def test_lazy_benchmark_reexport():
+    """PEP 562: benchmark symbols re-export lazily; unknown attrs still raise.
+
+    The eager import was removed to stop runpy's RuntimeWarning on
+    `python -m contrail_env.benchmark`; the public API must be unchanged.
+    """
+    import contrail_env
+
+    assert contrail_env.run_benchmark is run_benchmark
+    assert contrail_env.BenchmarkReport.__name__ == "BenchmarkReport"
+    with pytest.raises(AttributeError):
+        contrail_env.no_such_symbol  # noqa: B018
+
+
+def test_tts_median_iqr_infinite_tail_is_warning_free():
+    """A p_s = 0 seed makes TTS inf; the IQR is inf, computed without warning."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any RuntimeWarning becomes a failure
+        median, iqr = _tts_median_iqr([math.inf])
+    assert math.isinf(median) and math.isinf(iqr)
+    # A finite sample still gets a finite IQR.
+    _median, iqr2 = _tts_median_iqr([1.0, 3.0, 3.0, 5.0])
+    assert math.isfinite(iqr2) and iqr2 > 0.0
 
 
 def test_bootstrap_ci_brackets_mean():

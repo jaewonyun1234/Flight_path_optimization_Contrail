@@ -256,8 +256,15 @@ def _tts_median_iqr(values: Sequence[float]) -> tuple[float, float]:
         return math.nan, math.nan
     arr = np.asarray(values, dtype=float)
     median = float(np.median(arr))
-    q25, q75 = np.percentile(arr, [25, 75])
-    return median, float(q75 - q25)
+    # np.percentile interpolates between neighbours, and that lerp evaluates
+    # inf - inf = nan (a spurious "invalid value in subtract" RuntimeWarning,
+    # and a nan IQR) when a quartile lands on the infinite tail (p_s = 0 seeds).
+    # Silence just that check and report a non-finite spread as an infinite IQR
+    # — the honest summary of a heavy tail, not a dropped value.
+    with np.errstate(invalid="ignore"):
+        q25, q75 = np.percentile(arr, [25, 75])
+    spread = q75 - q25
+    return median, float(spread) if np.isfinite(spread) else math.inf
 
 
 def bootstrap_ci(
