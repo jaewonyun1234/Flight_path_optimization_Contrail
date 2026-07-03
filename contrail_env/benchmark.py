@@ -288,6 +288,18 @@ def bootstrap_ci(
 # THE PROTOCOL
 # =============================================================================
 
+def _approx_ratio(optimum: float, best_cost: float) -> float:
+    """optimum / best_cost, with the degenerate zero-cost case defined.
+
+    Under alpha_fuel = 0 an instance can have E* = 0 with a solver's best
+    repaired cost also 0, making the raw ratio 0/0. Define it: both ~0 -> 1.0
+    (the solver matched a free optimum); optimum ~0 but best > 0 -> 0.0.
+    """
+    if abs(best_cost) < 1e-12:
+        return 1.0 if abs(optimum) < 1e-12 else optimum / best_cost
+    return optimum / best_cost
+
+
 def _quantum_to_run(
     result: QuantumResult, optimum: float, optimum_exact: float, wall_clock_s: float
 ) -> SolverRun:
@@ -318,7 +330,7 @@ def _quantum_to_run(
         backend=result.backend,
         status="OK",
         best_cost=result.best_cost,
-        approx_ratio=optimum / result.best_cost if result.best_cost > 0 else math.nan,
+        approx_ratio=_approx_ratio(optimum, result.best_cost),
         feasibility_rate=result.feasibility_rate,
         wall_clock_s=wall_clock_s,
         n_samples=result.n_samples,

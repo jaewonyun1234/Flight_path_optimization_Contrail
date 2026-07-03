@@ -11,7 +11,7 @@ from contrail_env import (
     default_scenario_factory,
     run_benchmark,
 )
-from contrail_env.benchmark import SOLVER_NAMES, _tts_median_iqr
+from contrail_env.benchmark import SOLVER_NAMES, _approx_ratio, _tts_median_iqr
 
 # Columns that legitimately vary run-to-run: TTS ∝ t_shot is a wall-clock-
 # derived quantity (Rønnow et al. 2014), so it tracks machine load, not physics.
@@ -120,6 +120,13 @@ def test_tts_median_iqr_infinite_tail_is_warning_free():
     # A finite sample still gets a finite IQR.
     _median, iqr2 = _tts_median_iqr([1.0, 3.0, 3.0, 5.0])
     assert math.isfinite(iqr2) and iqr2 > 0.0
+
+
+def test_approx_ratio_zero_cost_edge_cases():
+    """0/0 is a matched free optimum (1.0), not a nan; the usual case unchanged."""
+    assert _approx_ratio(0.0, 0.0) == 1.0        # both ~0 → matched a free optimum
+    assert _approx_ratio(0.0, 5.0) == 0.0        # optimum 0, best > 0
+    assert _approx_ratio(10.0, 12.5) == pytest.approx(0.8)
 
 
 def test_bootstrap_ci_brackets_mean():
