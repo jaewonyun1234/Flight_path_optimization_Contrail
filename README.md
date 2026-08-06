@@ -1,100 +1,64 @@
-# Contrail-Aware Flight Optimization
+# Contrail-Aware Flight-Option Selection (Minimal QUBO Pipeline)
 
 [![CI](https://github.com/jaewonyun1234/Flight_path_optimization_Contrail/actions/workflows/ci.yml/badge.svg)](https://github.com/jaewonyun1234/Flight_path_optimization_Contrail/actions/workflows/ci.yml)
 
-Pick one altitude profile per flight to minimise `fuel + α·contrail + β·disruption`,
-subject to one option per flight, pairwise contrail conflicts, and sector-capacity
-limits. The problem is built on a synthetic airspace, encoded as a QUBO, and solved
-three ways:
+Pick one altitude option per flight to minimize fuel + contrail cost, with
+pairwise conflicts where two flights would seed the same ice-supersaturated
+region (ISSR) at the same time. Small enough to read line-by-line; still
+scientifically defensible (exact optimum, null baseline, feasibility metrics,
+seeded reproducibility).
 
-- **CP-SAT** (OR-Tools) — the classical ground-truth verifier;
-- **Pasqal analog-QAOA** — a hand-coded adiabatic Ω(t), δ(t) schedule on the Rydberg
-  blockade Hamiltonian, tuned by Bayesian optimization (`contrail_env/pasqal_analog.py`);
-- **Xanadu GBS** — Gaussian Boson Sampling of the Takagi-decomposed, WAW-weighted
-  complement graph (`contrail_env/xanadu_gbs.py`).
+## The QUBO
 
-A PyQt6 dashboard builds scenarios, solves them **in-process** with a live
-convergence curve, and runs the head-to-head benchmark (approximation ratio vs the
-CP-SAT optimum with bootstrap CIs, raw feasibility rate, wall clock). It's a single
-desktop process — no server, no broker.
+$$H = \sum_i c_i x_i \;+\; A \sum_f \Big(\sum_k x_{f,k} - 1\Big)^2 \;+\; B \sum_{(i,j)\in\mathcal{C}} x_i x_j$$
 
-The quantum pipelines need no quantum SDKs: each ships a dependency-free, physically
-faithful backend (a split-operator state-vector simulator of the Rydberg Hamiltonian;
-an exact Metropolis–Hastings sampler of the GBS distribution P(S) ∝ |Haf(B_S)|²).
-Installing `pip install -e ".[quantum]"` switches them to Pulser's QuTiP emulator and
-Strawberry Fields' gaussian backend automatically.
+- **cost** — $c_i$ = fuel proxy + $\alpha\,\cdot$ contrail exposure of option $i$
+- **one-hot** — every flight picks exactly one altitude option
+- **conflict** — conflicting option pairs $\mathcal{C}$ must not both be chosen
+
+Penalties are auto-computed with $A, B > c_\max - c_\min$ (2x safety), so
+breaking a constraint never pays.
+
+## Solvers reported
+
+| solver | role |
+|---|---|
+| brute force (`exact.py`) | exact ground truth $E_\min$ |
+| uniform random + repair (`exact.py`) | null baseline — structure-free floor |
+| analog-QAOA + Bayesian optimization (`pasqal_analog.py`) | the algorithm under study |
 
 ## Install & run
 
-```
-pip install -e ".[gui]"            # core + the PyQt6 desktop dashboard
-python gui/app.py                  # launch the dashboard
-```
-
-Requires Python 3.11+. Core deps are just the solver runtime (numpy, OR-Tools); the
-Qt/OpenGL dashboard stack lives in the `gui` extra, and the optional `[quantum]`
-SDKs in `[quantum]`.
-
-The dashboard has six tabs: live CP-SAT convergence (objective vs improvement), the
-conflict-graph topology, QUBO matrix statistics (size, sparsity, penalty constants),
-the chosen-option trade-offs, the quantum benchmark (CP-SAT vs Pasqal vs Xanadu over
-N seeds, with live convergence curves for the BO loop and the GBS sampler), and a
-geographic map — the ISSR risk as a marker overlay on a real Plotly `geo` basemap
-(country borders / coastlines, drawn with SVG and bundled offline vectors, so it
-needs no WebGL or network) with the chosen vs context routes animated on top.
-
-The benchmark also runs headless:
-
-```
-python -m contrail_env.benchmark --flights 4 --seeds 5 --csv results.csv
+```bash
+pip install -e ".[dev]"          # numpy only at runtime
+python run.py --flights 4 --options 3 --seeds 10 --shots 1000 --csv results.csv
 ```
 
-## Reproducibility
+The CSV has one row per (seed, solver): `n_vars`, `E_min`, `best_cost`,
+`approx_ratio`, `feasibility_rate`, `wall_clock_s`; a mean ± std summary
+prints at the end.
 
-Every sampler is seeded, so two benchmark runs with the same seeds produce
-**byte-identical scientific columns** in the CSV — costs, approximation ratios,
-feasibility and success rates, and the constraint-fingerprint means all match
-exactly. The only columns that legitimately vary between runs are the three
-timing-derived ones (`wall_clock_s`, `tts_sample_s`, `tts_total_s`): time-to-
-solution is a wall-clock-derived quantity (TTS ∝ t_shot, Rønnow et al. 2014),
-so it tracks machine load rather than the physics. This contract is enforced by
-`tests/test_benchmark.py::test_determinism_science_columns`.
+The unit-disk embeddability study (purely classical — how large can the
+conflict graph grow before Pasqal's blockade geometry stops fitting?):
 
-## ISSR field
-
-The airspace's contrail zones (ice-supersaturated regions) are synthetic
-Gaussian blobs — a controllable obstacle field for the optimizer to route
-around. The field is consumed through a small `ISSRField` interface
-(`rhi_excess`, `is_inside`, `mask_grid`), so the *source* of the field is
-pluggable without touching `World` or the QUBO assembly.
-
-## Layout
-
-```
-contrail_env/   synthetic environment, ISSR field, geo anchor, QUBO assembly,
-                CP-SAT solver, quantum pipelines (pasqal_analog, xanadu_gbs,
-                quantum_common, bayes_opt), the scenario builder (scenario.py),
-                and the benchmark protocol (benchmark.py)
-gui/            PyQt6 dashboard (builds + solves scenarios in-process)
-tests/          environment build, CP-SAT vs brute-force, quantum solvers vs
-                brute-force, benchmark round-trip, GUI map panel
+```bash
+python -m contrail_env.embedding_study --csv embedding.csv
 ```
 
-## Development
+Optional: `pip install -e ".[quantum]"` adds the real Pulser/QuTiP emulator
+backend (used automatically when the instance embeds and fits 12 qubits).
+
+## Modules
 
 ```
-pip install -e ".[dev]"
-ruff check .
-mypy contrail_env
-pytest
+contrail_env/problem.py          scenario generator (grid, ISSR blobs, costs, conflicts)
+contrail_env/qubo.py             QUBO matrix assembly (cost + one-hot + conflict)
+contrail_env/exact.py            brute force, repair, random baseline, metrics
+contrail_env/pasqal_analog.py    analog schedule, statevector simulator, BO loop
+contrail_env/bayes_opt.py        minimal GP + expected-improvement optimizer
+contrail_env/embedding_study.py  greedy unit-disk embedder + scaling study
+run.py                           end-to-end experiment script
 ```
 
-CI runs the same checks on every push and pull request.
-
-## Roadmap
-
-- Run the Pasqal pipeline on real Pulser hardware: needs `[quantum]` extras plus a
-  conflict graph that embeds as a valid unit-disk register (auto-detected; the
-  built-in simulator is the fallback).
-- Strawberry Fields X8 hardware demo on a reduced 8-mode subproblem.
-- Larger instances for the Pasqal path (n > 20 qubits) via an MPS-style emulator tier.
+The full multi-solver version (CP-SAT, Xanadu GBS, PyQt6 GUI, diagnostics)
+lives on the [`archive/full-benchmark`](https://github.com/jaewonyun1234/Flight_path_optimization_Contrail/tree/archive/full-benchmark) branch.
