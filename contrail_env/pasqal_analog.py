@@ -49,7 +49,7 @@ from .embedding_study import (
     greedy_embedding,
     independence_edges,
 )
-from .exact import SolveResult, evaluate_samples
+from .exact import SolveResult, evaluate_samples, raw_metrics
 from .problem import Scenario
 from .qubo import QUBOInstance
 
@@ -422,6 +422,7 @@ def solve_pasqal_analog(
     if cost < best_cost:
         best_cost = cost
         best_z = z
+    raw_best, raw_mean, _ = raw_metrics(final_samples, qubo)
 
     return SolveResult(
         solver="pasqal-analog",
@@ -430,4 +431,6 @@ def solve_pasqal_analog(
         feasibility_rate=feas,
         n_samples=n_shots,
         wall_clock_s=time.perf_counter() - t0,
+        raw_best_E=raw_best,
+        raw_mean_E=raw_mean,
     )
