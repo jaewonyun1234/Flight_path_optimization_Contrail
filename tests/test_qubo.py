@@ -33,9 +33,22 @@ def test_energy_matches_hand_computation():
 def test_penalty_bound_holds():
     scenario = make_scenario(4, 3, seed=1)
     qubo = assemble_qubo(scenario)
-    spread = float(scenario.costs.max() - scenario.costs.min())
-    assert qubo.penalty_A > spread
-    assert qubo.penalty_B > spread
+    # A, B > c_max: skipping a flight saves up to its FULL option cost,
+    # so the spread c_max - c_min is not a safe bound.
+    assert qubo.penalty_A > float(scenario.costs.max())
+    assert qubo.penalty_B > float(scenario.costs.max())
+
+
+def test_ground_state_feasible_small_spread():
+    # Regression: with alpha=0 the cost spread is tiny but each option
+    # still costs ~50 units. Under the old A > c_max - c_min bound the
+    # ground state dropped whole flights (infeasible) in every seed.
+    for seed in range(10):
+        scenario = make_scenario(4, 3, seed, alpha=0.0)
+        qubo = assemble_qubo(scenario)
+        z_opt, _e_min = brute_force_optimum(qubo)
+        feasible, violations = is_feasible(z_opt, qubo)
+        assert feasible, f"seed {seed}: {violations}"
 
 
 def test_feasible_optimum_has_zero_penalty_energy():

@@ -30,11 +30,23 @@ KEY FORMULAS
       + B * sum_{(i,j) in conflicts} x_i x_j              [conflict]
 
 The penalty constants A, B are AUTO-COMPUTED to satisfy the bound
-    A, B > c_max - c_min
+    A, B > c_max
 with a configurable safety factor (default 2x). WHY: breaking a
-constraint must never pay. The most a violation could ever "save" is the
-full cost spread c_max - c_min, so any penalty above that spread makes
-every infeasible state strictly worse than the best feasible one.
+constraint must never pay.
+
+    - One-hot UNDER-selection (a flight picks nothing) saves the whole
+      option cost that flight would otherwise have paid — up to c_max —
+      and incurs the fine A. So A > c_max makes skipping never pay.
+      (A bound of c_max - c_min is NOT enough: dropping a flight saves
+      its full cost, not just the spread between its options.)
+    - One-hot OVER-selection only ADDS cost and ADDS fine, so it is
+      never favorable at any positive A.
+    - A conflict violation can save at most c_max - c_min < c_max, so
+      B > c_max covers it too.
+
+We use c_max and not something astronomically large on purpose: analog
+hardware has a finite dynamic range (detuning vs blockade), so penalties
+should be no larger than the correctness argument needs.
 """
 
 from __future__ import annotations
@@ -118,18 +130,19 @@ def assemble_qubo(scenario: Scenario, safety_factor: float = 2.0) -> QUBOInstanc
     flight (i div K).
 
     Penalty constants:
-        Let delta = max(cost) - min(cost).
-        A = B = safety_factor * (1 + delta)
-    which satisfies the A, B > c_max - c_min bound (the +1 keeps the
-    penalty strictly positive even when all costs are equal).
+        A = B = safety_factor * (1 + c_max)
+    which satisfies the A, B > c_max bound (see the module docstring:
+    skipping a flight saves up to its FULL option cost, so the spread
+    c_max - c_min is not a safe bound; the +1 keeps the penalty strictly
+    positive even when all costs are zero).
     """
     n = scenario.n_vars
     costs = np.asarray(scenario.costs, dtype=float)
 
     # ----- 1. Compute penalty constants -----
-    delta = float(costs.max() - costs.min())
-    A_penalty = safety_factor * (1.0 + delta)
-    B_penalty = safety_factor * (1.0 + delta)
+    c_max = float(costs.max())
+    A_penalty = safety_factor * (1.0 + c_max)
+    B_penalty = safety_factor * (1.0 + c_max)
 
     # ----- 2. Initialize Q and constant -----
     Q = np.zeros((n, n), dtype=float)
