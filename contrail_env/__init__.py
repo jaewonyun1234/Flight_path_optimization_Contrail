@@ -1,231 +1,46 @@
 """
-contrail_env — Synthetic environment for contrail-aware flight option selection.
+contrail_env — Minimal contrail-aware flight-option QUBO pipeline.
 
-This is the FOUNDATION of the quantum-optimization project. It produces
-all the structures the quantum solvers (Pasqal, Xanadu) and the classical
-verifier (CP-SAT) consume:
-
-    - A planning region (AirspaceGrid)
-    - Ice-supersaturated regions (ISSRField)
-    - ATC sectors with capacities (SectorMap, Sector)
-    - Aircraft performance (Aircraft, LinearJetPerformance)
-    - Flights with baseline + alternative altitude profiles (Flight, AltitudeProfile)
-    - Scored options (EvaluatedOption)
-    - The conflict graph and QUBO matrix (QUBOInstance)
-
-USAGE PATTERN
-=============
-
-    from contrail_env import (
-        default_european_world,
-        build_random_flights, build_and_evaluate_flight,
-        build_conflict_graph, build_capacity_buckets,
-        assemble_qubo, brute_force_optimum,
-    )
-
-    # 1. Build the world (airspace + ISSRs + sectors)
-    world = default_european_world(seed=42)
-
-    # 2. Build flights and their options
-    flights = build_random_flights(n_flights=4, world=world, seed=42)
-    all_evals = []
-    for f in flights:
-        all_evals.extend(build_and_evaluate_flight(f, world))
-
-    # 3. Construct constraint structures
-    conflicts = build_conflict_graph(all_evals, world)
-    buckets   = build_capacity_buckets(all_evals, world)
-
-    # 4. Assemble the QUBO matrix
-    qubo = assemble_qubo(all_evals, conflicts, buckets)
-
-    # 5. Hand qubo.Q off to your solver (CP-SAT / Pasqal / Xanadu)
-    #    or brute-force for verification on small instances:
-    z_opt, cost_opt, energy_opt = brute_force_optimum(qubo, all_evals)
+One algorithm under study (Pasqal-style analog-QAOA + Bayesian
+optimization), benchmarked against brute-force ground truth and a
+uniform-random baseline. See problem.py for the model in plain language.
 """
 
-from typing import Any
-
-# Units
-from .units import (
-    M_PER_FT, FT_PER_M, M_PER_NM, NM_PER_KM,
-    MS_PER_KT, KT_PER_MS, KM_PER_DEG_LAT,
-    fl_to_ft, ft_to_fl, fl_to_m, m_to_fl,
-    isa_temperature, speed_of_sound_ms, mach_to_ms, ms_to_mach,
+from .bayes_opt import BOResult, gp_minimize
+from .embedding_study import (
+    EmbeddingReport,
+    check_embedding,
+    greedy_embedding,
+    independence_edges,
+    run_embedding_study,
 )
-
-# Synthetic ISSRs
-from .synthetic_issr import (
-    ISSRBlob, ISSRField,
-    random_issr_field, hand_placed_issr_field,
-    issr_area_coverage,
+from .exact import (
+    SolveResult,
+    approximation_ratio,
+    brute_force_optimum,
+    evaluate_samples,
+    mean_random_cost,
+    repair,
+    solve_random,
 )
-
-# Airspace
-from .airspace import (
-    AirspaceGrid, Sector, SectorMap,
-    uniform_sector_grid,
-    voxelize_trajectory, densify_waypoints,
-)
-
-# World
-from .world import World, default_european_world
-
-# Aircraft
-from .aircraft import (
-    AircraftPerformance, LinearJetPerformance, Aircraft, a320_like,
-)
-
-# Flight model
-from .flight import (
-    AltitudeSegment, AltitudeProfile, Flight,
-    available_fls,
-    build_baseline_profile, replace_segment_fl, shift_all_segments,
-    waypoints_for, evaluate_option, EvaluatedOption,
-)
-
-# Options
-from .options import (
-    OptionKind, OptionSpec,
-    enumerate_option_specs,
-    build_and_evaluate_flight, build_random_flights,
-)
-
-# QUBO
-from .qubo import (
-    ConflictEdge, CapacityBucket, QUBOInstance,
-    build_conflict_graph, build_capacity_buckets, assemble_qubo,
-    is_feasible, cost_of_assignment, brute_force_optimum,
-)
-
-# CP-SAT classical ground-truth solver
-from .solver_cpsat import (
-    CPSATResult, solve_cpsat, enumerate_optimum,
-)
-
-# Quantum solver core (shared by Pasqal + Xanadu pipelines)
-from .quantum_common import (
-    BackendBudgetError, OptionGraph, QuantumResult,
-    build_option_graph, repair_sample, sample_is_feasible,
-    penalized_energy, evaluate_samples,
-)
-
-# Pasqal neutral-atom analog pipeline
 from .pasqal_analog import (
-    AnnealSchedule, RydbergStatevector,
-    solve_pasqal_analog, pulser_available,
+    AnnealSchedule,
+    BackendBudgetError,
+    EmbeddingError,
+    RydbergStatevector,
+    node_weights,
+    pulser_available,
+    solve_pasqal_analog,
 )
-
-# Xanadu photonic GBS pipeline
-from .xanadu_gbs import (
-    GBSEncoding, GBSSubsetSampler,
-    encode_option_graph, hafnian, takagi_symmetric,
-    solve_xanadu_gbs, strawberryfields_available,
-)
-
-# Classical sampling baselines (null control + simulated annealing)
-from .classical_baselines import (
-    solve_random_repair, solve_simulated_annealing,
-)
-
-# Per-shot benchmark statistics (success probability + time-to-solution)
-from .metrics import success_probability, time_to_solution
-
-# Instantaneous spectrum of the analog sweep (adiabaticity diagnostic)
-from .spectral import (
-    AnalogSpectrum, hamiltonian_matvec, instantaneous_spectrum, lowest_eigenpairs,
-)
-
-# Time-resolved dynamics diagnostics (entropy, ground population, residual energy)
-from .dynamics import (
-    DynamicsRecord, ResidualEnergyResult,
-    bipartite_entropy, default_cuts, residual_energy_vs_T, run_with_diagnostics,
-)
-
-# Constraint-violation fingerprint (raw pre-repair sample decomposition)
-from .fingerprint import (
-    Fingerprint, ViolationStats, fingerprint_bitstrings, fingerprint_to_flat_dict,
-)
-
-# Benchmark protocol (CP-SAT vs Pasqal vs Xanadu) — imported LAZILY via the
-# PEP 562 __getattr__ below (see the note there), not eagerly here.
-_BENCHMARK_EXPORTS = frozenset({
-    "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
-    "run_benchmark", "default_scenario_factory", "bootstrap_ci",
-})
+from .problem import Scenario, make_scenario
+from .qubo import QUBOInstance, assemble_qubo, cost_of_assignment, is_feasible
 
 __all__ = [
-    # Units
-    "M_PER_FT", "FT_PER_M", "M_PER_NM", "NM_PER_KM",
-    "MS_PER_KT", "KT_PER_MS", "KM_PER_DEG_LAT",
-    "fl_to_ft", "ft_to_fl", "fl_to_m", "m_to_fl",
-    "isa_temperature", "speed_of_sound_ms", "mach_to_ms", "ms_to_mach",
-    # ISSRs
-    "ISSRBlob", "ISSRField",
-    "random_issr_field", "hand_placed_issr_field",
-    "issr_area_coverage",
-    # Airspace
-    "AirspaceGrid", "Sector", "SectorMap",
-    "uniform_sector_grid",
-    "voxelize_trajectory", "densify_waypoints",
-    # World
-    "World", "default_european_world",
-    # Aircraft
-    "AircraftPerformance", "LinearJetPerformance", "Aircraft", "a320_like",
-    # Flight
-    "AltitudeSegment", "AltitudeProfile", "Flight",
-    "available_fls",
-    "build_baseline_profile", "replace_segment_fl", "shift_all_segments",
-    "waypoints_for", "evaluate_option", "EvaluatedOption",
-    # Options
-    "OptionKind", "OptionSpec",
-    "enumerate_option_specs",
-    "build_and_evaluate_flight", "build_random_flights",
-    # QUBO
-    "ConflictEdge", "CapacityBucket", "QUBOInstance",
-    "build_conflict_graph", "build_capacity_buckets", "assemble_qubo",
-    "is_feasible", "cost_of_assignment", "brute_force_optimum",
-    # CP-SAT solver
-    "CPSATResult", "solve_cpsat", "enumerate_optimum",
-    # Quantum core
-    "BackendBudgetError", "OptionGraph", "QuantumResult",
-    "build_option_graph", "repair_sample", "sample_is_feasible",
-    "penalized_energy", "evaluate_samples",
-    # Pasqal
-    "AnnealSchedule", "RydbergStatevector",
-    "solve_pasqal_analog", "pulser_available",
-    # Xanadu
-    "GBSEncoding", "GBSSubsetSampler",
-    "encode_option_graph", "hafnian", "takagi_symmetric",
-    "solve_xanadu_gbs", "strawberryfields_available",
-    # Classical baselines
-    "solve_random_repair", "solve_simulated_annealing",
-    # Per-shot metrics
-    "success_probability", "time_to_solution",
-    # Spectral diagnostics
-    "AnalogSpectrum", "hamiltonian_matvec", "instantaneous_spectrum", "lowest_eigenpairs",
-    # Dynamics diagnostics
-    "DynamicsRecord", "ResidualEnergyResult",
-    "bipartite_entropy", "default_cuts", "residual_energy_vs_T", "run_with_diagnostics",
-    # Constraint fingerprint
-    "Fingerprint", "ViolationStats", "fingerprint_bitstrings", "fingerprint_to_flat_dict",
-    # Benchmark
-    "BenchmarkReport", "InstanceResult", "SolverRun", "SolverStats",
-    "run_benchmark", "default_scenario_factory", "bootstrap_ci",
+    "AnnealSchedule", "BOResult", "BackendBudgetError", "EmbeddingError",
+    "EmbeddingReport", "QUBOInstance", "RydbergStatevector", "Scenario",
+    "SolveResult", "approximation_ratio", "assemble_qubo", "brute_force_optimum",
+    "check_embedding", "cost_of_assignment", "evaluate_samples", "gp_minimize",
+    "greedy_embedding", "independence_edges", "is_feasible", "make_scenario",
+    "mean_random_cost", "node_weights", "pulser_available", "repair",
+    "run_embedding_study", "solve_pasqal_analog", "solve_random",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    """Lazily re-export the benchmark symbols (PEP 562).
-
-    Importing `.benchmark` eagerly at package-import time put it in
-    `sys.modules` before `python -m contrail_env.benchmark` could execute it
-    as `__main__`, so runpy emitted a RuntimeWarning ("found in sys.modules …
-    prior to execution"). Deferring the import to first attribute access keeps
-    the public API identical (`from contrail_env import run_benchmark` still
-    works) without the pre-import.
-    """
-    if name in _BENCHMARK_EXPORTS:
-        from . import benchmark
-        return getattr(benchmark, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

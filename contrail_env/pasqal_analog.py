@@ -1,5 +1,5 @@
 """
-pasqal_analog.py — Pasqal neutral-atom analog pipeline (plan §7).
+pasqal_analog.py — Pasqal neutral-atom analog pipeline.
 
 Hand-coded adiabatic schedule Omega(t), delta(t) + Bayesian optimization of
 its four parameters (T, Omega_max, delta_init, delta_final) following
@@ -21,12 +21,11 @@ detuning scale factors (heavier node = stronger drive toward |r>).
 EXECUTION BACKENDS
 ==================
     "statevector"  Built-in split-operator (Strang) integrator of H(t).
-                   Exact dynamics, dependency-free, <= 20 qubits — the
-                   role emu-sv plays in the plan's tier table (§9.1).
+                   Exact dynamics, dependency-free, <= 20 qubits.
     "pulser"       Real Pulser Sequence on AnalogDevice via the QuTiP
                    emulator. Requires `pip install pulser pulser-simulation`
                    AND a conflict graph that embeds as a unit-disk register
-                   (most synthetic instances do not — falls back cleanly).
+                   (see embedding_study.py — falls back cleanly when not).
     "auto"         pulser when available + embeddable + small enough,
                    else statevector.
 
@@ -44,35 +43,32 @@ from dataclasses import dataclass
 import numpy as np
 
 from .bayes_opt import gp_minimize
-from .fingerprint import fingerprint_to_flat_dict
-from .flight import EvaluatedOption
-from .quantum_common import (
-    BackendBudgetError,
-    OptionGraph,
-    QuantumResult,
-    build_option_graph,
-    evaluate_samples,
-    make_result,
+from .embedding_study import (
+    MIN_ATOM_DISTANCE_UM,
+    check_embedding,
+    greedy_embedding,
+    independence_edges,
 )
-from .qubo import CapacityBucket, ConflictEdge
+from .exact import SolveResult, evaluate_samples
+from .problem import Scenario
+from .qubo import QUBOInstance
 
-# --- Pulser AnalogDevice hardware envelope (Pulser docs, plan §7.1) ---------
+# --- Pulser AnalogDevice hardware envelope (Pulser docs) --------------------
 OMEGA_MAX_HW = 12.57          # rad/us, max Rabi amplitude
 DETUNING_MAX_HW = 125.66      # rad/us, max |detuning|
 T_MAX_NS = 6000.0             # max sequence duration
-MIN_ATOM_DISTANCE_UM = 5.0    # min register spacing
 C6_OVER_HBAR = 865_723.02     # rad us^-1 um^6, Rydberg level n=60
 
 # Blockade strength for edge pairs placed at the minimum spacing.
 U_BLOCKADE = C6_OVER_HBAR / MIN_ATOM_DISTANCE_UM**6   # ~55.4 rad/us
 
-# Tier limits (plan §9.1): dense statevector is the emu-sv-class tier here;
-# the QuTiP-backed Pulser emulator is the smallest tier.
+# Dense statevector holds one complex amplitude per basis state (2^n), so
+# 20 qubits is the laptop ceiling; the QuTiP emulator tier is smaller.
 MAX_STATEVECTOR_QUBITS = 20
 MAX_PULSER_QUBITS = 12
 
-# Bayesian-optimization search box, Tibaldi-style (plan §7.6), clipped to
-# hardware. delta_final stays well below U_BLOCKADE so the blockade wins.
+# Bayesian-optimization search box, Tibaldi-style, clipped to hardware.
+# delta_final stays well below U_BLOCKADE so the blockade always wins.
 BO_BOUNDS: list[tuple[float, float]] = [
     (1500.0, T_MAX_NS),     # T_ns
     (4.0, OMEGA_MAX_HW),    # Omega_max  [rad/us]
@@ -81,13 +77,21 @@ BO_BOUNDS: list[tuple[float, float]] = [
 ]
 
 
+class BackendBudgetError(RuntimeError):
+    """Instance exceeds the qubit budget of the requested backend."""
+
+
+class EmbeddingError(RuntimeError):
+    """The independence graph admits no valid unit-disk register layout."""
+
+
 # =============================================================================
 # ANALOG SCHEDULE
 # =============================================================================
 
 @dataclass(frozen=True)
 class AnnealSchedule:
-    """The four-parameter adiabatic schedule of plan §7.4.
+    """The four-parameter adiabatic schedule.
 
     Omega(t): 0 -> Omega_max (ramp), hold, -> 0 (ramp).
     delta(t): hold delta_init (< 0, favors |g>), linear sweep, hold
@@ -126,6 +130,17 @@ class AnnealSchedule:
 # BUILT-IN STATE-VECTOR SIMULATOR (split-operator, exact dynamics)
 # =============================================================================
 
+def node_weights(costs: np.ndarray) -> np.ndarray:
+    """Weighted-MIS node weights: w_i = c_max - c_i + margin.
+
+    The cheapest option becomes the heaviest node and every weight stays
+    strictly positive, so the detuning always pulls toward good options.
+    """
+    costs = np.asarray(costs, dtype=float)
+    span = max(float(costs.max() - costs.min()), 1.0)
+    return (costs.max() - costs) + 0.25 * span
+
+
 class RydbergStatevector:
     """Dense state-vector integrator of the analog Rydberg Hamiltonian.
 
@@ -135,16 +150,19 @@ class RydbergStatevector:
     U*dt <~ 0.4 rad per step the second-order splitting error is far below
     sampling noise.
 
-    Memory is one complex vector of length 2^n, so n <= 20 on a laptop —
-    the same niche emu-sv fills in the plan's emulator tiers.
+    Memory is one complex vector of length 2^n, so n <= 20 on a laptop.
     """
 
-    def __init__(self, graph: OptionGraph) -> None:
-        n = graph.n
+    def __init__(
+        self,
+        n: int,
+        weights: np.ndarray,
+        edges: list[tuple[int, int]],
+    ) -> None:
         if n > MAX_STATEVECTOR_QUBITS:
             raise BackendBudgetError(
                 f"statevector backend: n = {n} qubits exceeds the "
-                f"{MAX_STATEVECTOR_QUBITS}-qubit budget (plan §9.1 tier table)"
+                f"{MAX_STATEVECTOR_QUBITS}-qubit budget"
             )
         self.n = n
         states = np.arange(1 << n, dtype=np.int64)
@@ -152,7 +170,7 @@ class RydbergStatevector:
         # Per-atom detuning scale u_i in [0.6, 1.0]: heavier (cheaper) nodes
         # are pushed harder toward |r>. This is the weighted-MIS detuning
         # choice, variant "local detuning" of arXiv:2510.25473.
-        w = graph.weights
+        w = np.asarray(weights, dtype=float)
         w_span = float(w.max() - w.min())
         u = 0.6 + 0.4 * (w - w.min()) / (w_span if w_span > 0 else 1.0)
         self.detuning_scale = u
@@ -162,53 +180,17 @@ class RydbergStatevector:
         for q in range(n):
             detune_load += u[q] * ((states >> q) & 1)
         inter = np.zeros(1 << n)
-        for i, j in graph.independence_edges():
+        for i, j in edges:
             inter += U_BLOCKADE * (((states >> i) & 1) * ((states >> j) & 1))
         self._detune_load = detune_load
         self._inter = inter
 
-    @property
-    def interaction_diag(self) -> np.ndarray:
-        """Read-only U·#edges-on(z) per basis state — reused by spectral.py."""
-        return self._inter
-
-    @property
-    def detune_load(self) -> np.ndarray:
-        """Read-only sum_i u_i·bit_i(z) per basis state — reused by spectral.py."""
-        return self._detune_load
-
-    def run(
-        self,
-        schedule: AnnealSchedule,
-        n_steps: int = 500,
-        on_step: Callable[[int, int], None] | None = None,
-        *,
-        observer: Callable[[int, np.ndarray], None] | None = None,
-        observe_stride: int = 0,
-    ) -> np.ndarray:
-        """Evolve |00...0> under H(t) and return the 2^n outcome probabilities.
-
-        `on_step(steps_done, n_steps)` fires every ~5% of the integration —
-        a liveness heartbeat for callers (one evolution at 19-20 qubits takes
-        minutes, and without this there is no sign of life in between).
-
-        `observer(step, psi)` (§S4), when set, is ALWAYS called once with step=0
-        before the loop, and again after the SECOND half_phase multiply of step
-        k whenever observe_stride > 0 and (k+1) % observe_stride == 0.
-        observe_stride=0 (the default) skips only the periodic in-loop calls, so
-        a caller that only wants the initial state can leave it unset. `psi` is
-        the LIVE buffer: observers must not mutate it and must .copy() anything
-        they keep, since the next iteration overwrites it in place. `observer`
-        left as None (the default) must not change `probs` at all.
-        """
+    def run(self, schedule: AnnealSchedule, n_steps: int = 500) -> np.ndarray:
+        """Evolve |00...0> under H(t); return the 2^n outcome probabilities."""
         n = self.n
         dt = (schedule.T_ns / 1000.0) / n_steps  # us; energies are rad/us
         psi = np.zeros(1 << n, dtype=np.complex128)
         psi[0] = 1.0
-        stride = max(1, n_steps // 20)
-
-        if observer is not None:
-            observer(0, psi)
 
         for k in range(n_steps):
             s = (k + 0.5) / n_steps
@@ -226,41 +208,32 @@ class RydbergStatevector:
                 block[:, 0, :] = c * a + ms * b
                 block[:, 1, :] = ms * a + c * b
             psi *= half_phase
-            if on_step is not None and (k + 1) % stride == 0:
-                on_step(k + 1, n_steps)
-            if observer is not None and observe_stride > 0 and (k + 1) % observe_stride == 0:
-                observer(k + 1, psi)
 
         probs = np.abs(psi) ** 2
         return probs / probs.sum()
 
 
-def penalized_energy_vector(graph: OptionGraph) -> np.ndarray:
+def penalized_energy_vector(scenario: Scenario, qubo: QUBOInstance) -> np.ndarray:
     """Penalty-form energy of EVERY basis state, vectorized (length 2^n).
 
     Lets the Bayesian-optimization objective be the exact expectation
     <E> = sum_z p_z E(z) instead of a noisy shot average — deterministic,
     smooth, and free once the state vector exists.
     """
-    n = graph.n
+    n = scenario.n_vars
     states = np.arange(1 << n, dtype=np.int64)
-    p = graph.penalty()
+    p = qubo.penalty_A
 
     energy = np.zeros(1 << n)
     for i in range(n):
-        energy += graph.costs[i] * ((states >> i) & 1)
-    for members in graph.groups.values():
+        energy += scenario.costs[i] * ((states >> i) & 1)
+    for members in scenario.groups():
         occ = np.zeros(1 << n)
         for m in members:
             occ += (states >> m) & 1
         energy += p * (occ - 1.0) ** 2
-    for i, j in graph.conflict_edges:
+    for i, j in scenario.conflicts:
         energy += p * (((states >> i) & 1) * ((states >> j) & 1))
-    for members, cap in graph.buckets:
-        occ = np.zeros(1 << n)
-        for m in members:
-            occ += (states >> m) & 1
-        energy += p * np.maximum(0.0, occ - cap) ** 2
     return energy
 
 
@@ -274,48 +247,27 @@ def _sample_bits(probs: np.ndarray, n: int, shots: int, rng: np.random.Generator
 # OPTIONAL: REAL PULSER BACKEND (hardware-grade Sequence on AnalogDevice)
 # =============================================================================
 
-class EmbeddingError(RuntimeError):
-    """The independence graph admits no valid unit-disk register layout."""
+def unit_disk_register(scenario: Scenario) -> np.ndarray:
+    """2D register layout for the scenario's independence graph.
 
-
-def unit_disk_embedding(graph: OptionGraph, r_blockade_um: float = 8.0) -> np.ndarray:
-    """2D register layout: edges within the blockade radius, non-edges outside.
-
-    Layout: each flight's option clique sits on a small circle (always
-    mutually blockaded = one-hot), flight clusters sit on a large circle.
-    Validates every pair against the disk-graph condition and raises
-    EmbeddingError when the conflict topology is not unit-disk — which is
-    the common case for arbitrary conflict graphs; the caller then falls
-    back to the ideal-blockade statevector backend.
+    Uses the shared greedy embedder (embedding_study.py, single source of
+    truth) and raises EmbeddingError when the result is not a valid
+    unit-disk placement — the common case for arbitrary conflict graphs;
+    the caller then falls back to the ideal-blockade statevector backend.
     """
-    edges = set(graph.independence_edges())
-    coords = np.zeros((graph.n, 2))
-    n_groups = len(graph.groups)
-    big_r = 1.6 * r_blockade_um * max(1.0, n_groups / math.pi)
-    for g_idx, members in enumerate(graph.groups.values()):
-        phi = 2.0 * math.pi * g_idx / max(1, n_groups)
-        center = big_r * np.array([math.cos(phi), math.sin(phi)])
-        k = len(members)
-        for m_idx, m in enumerate(members):
-            ang = 2.0 * math.pi * m_idx / max(1, k)
-            local_r = 0.35 * r_blockade_um
-            coords[m] = center + local_r * np.array([math.cos(ang), math.sin(ang)])
-
-    for i in range(graph.n):
-        for j in range(i + 1, graph.n):
-            d = float(np.linalg.norm(coords[i] - coords[j]))
-            if d < MIN_ATOM_DISTANCE_UM:
-                raise EmbeddingError(f"atoms {i},{j} closer than hardware minimum")
-            is_edge = (i, j) in edges
-            if is_edge and d > 0.95 * r_blockade_um:
-                raise EmbeddingError(f"edge {i}-{j} outside blockade radius")
-            if not is_edge and d < 1.05 * r_blockade_um:
-                raise EmbeddingError(f"non-edge {i}-{j} inside blockade radius")
+    edges = independence_edges(scenario)
+    coords = greedy_embedding(scenario.n_vars, edges)
+    report = check_embedding(coords, edges)
+    if not report.valid:
+        raise EmbeddingError(
+            f"no valid unit-disk layout: {report.missing_edges} missing, "
+            f"{report.spurious_edges} spurious edge(s)"
+        )
     return coords
 
 
 def _pulser_sample(
-    graph: OptionGraph,
+    scenario: Scenario,
     schedule: AnnealSchedule,
     shots: int,
 ) -> np.ndarray:
@@ -325,11 +277,11 @@ def _pulser_sample(
     from pulser.waveforms import InterpolatedWaveform  # type: ignore[import-not-found]
     from pulser_simulation import QutipEmulator  # type: ignore[import-not-found]
 
-    if graph.n > MAX_PULSER_QUBITS:
+    if scenario.n_vars > MAX_PULSER_QUBITS:
         raise BackendBudgetError(
-            f"pulser/QuTiP tier: n = {graph.n} > {MAX_PULSER_QUBITS} qubits"
+            f"pulser/QuTiP tier: n = {scenario.n_vars} > {MAX_PULSER_QUBITS} qubits"
         )
-    coords = unit_disk_embedding(graph)
+    coords = unit_disk_register(scenario)
     register = Register.from_coordinates(coords, prefix="q")
 
     duration = int(schedule.T_ns)
@@ -366,9 +318,8 @@ def pulser_available() -> bool:
 # =============================================================================
 
 def solve_pasqal_analog(
-    evals: list[EvaluatedOption],
-    conflicts: list[ConflictEdge],
-    buckets: list[CapacityBucket],
+    scenario: Scenario,
+    qubo: QUBOInstance,
     *,
     n_shots: int = 1000,
     bo_iters: int = 16,
@@ -376,82 +327,56 @@ def solve_pasqal_analog(
     seed: int = 0,
     backend: str = "auto",
     on_progress: Callable[[int, float], None] | None = None,
-    on_phase: Callable[[str, float], None] | None = None,
-) -> QuantumResult:
+) -> SolveResult:
     """Analog-QAOA + Bayesian optimization for the flight-option QUBO.
 
-    Pipeline (plan §7, §10.1 step 3): embed the OptionGraph as a blockade
-    Hamiltonian; Bayes-optimize the schedule against the exact penalized
-    energy expectation; sample `n_shots` bitstrings from the best schedule;
+    Pipeline: realize the independence graph as a blockade Hamiltonian;
+    Bayes-optimize the schedule against the exact penalized energy
+    expectation; sample `n_shots` bitstrings from the best schedule;
     repair; report best repaired cost, raw feasibility rate, wall clock.
 
     `on_progress(iteration, best_repaired_cost_so_far)` fires once per BO
-    evaluation — this is the convergence curve of plan §10.3.
-
-    `on_phase(message, fraction_done)` is a fine-grained liveness heartbeat:
-    it fires ~20 times per Schrödinger integration, so callers (the GUI) can
-    show progress even when a single BO evaluation takes minutes.
+    evaluation — this is the convergence curve.
     """
     t0 = time.perf_counter()
     rng = np.random.default_rng(seed)
-    graph = build_option_graph(evals, conflicts, buckets)
 
     use_pulser = False
     if backend == "pulser":
         use_pulser = True
-    elif backend == "auto" and pulser_available() and graph.n <= MAX_PULSER_QUBITS:
+    elif backend == "auto" and pulser_available() and scenario.n_vars <= MAX_PULSER_QUBITS:
         try:
-            unit_disk_embedding(graph)
+            unit_disk_register(scenario)
             use_pulser = True
         except EmbeddingError:
             use_pulser = False
 
     sim: RydbergStatevector | None = None
-    energy_vec: np.ndarray | None = None
     if not use_pulser:
-        sim = RydbergStatevector(graph)
-        energy_vec = penalized_energy_vector(graph)
+        sim = RydbergStatevector(
+            scenario.n_vars,
+            node_weights(scenario.costs),
+            independence_edges(scenario),
+        )
+    energy_vec = penalized_energy_vector(scenario, qubo)
 
     # Track the best repaired solution seen anywhere (BO probes included).
     best_cost = float("inf")
-    best_indices: list[int] = []
-    history: list[tuple[int, float]] = []
+    best_z = np.zeros(scenario.n_vars, dtype=int)
+    feasibility = 0.0
     iteration = 0
 
-    def consume(samples: np.ndarray) -> float:
-        """Score one schedule's samples; update incumbent + history.
-
-        collect_fingerprint=False: this fires once per BO probe (tuning
-        overhead) and only best_cost is read, so skip the extra repair pass
-        the §S5 fingerprint would cost here.
-        """
-        nonlocal best_cost, best_indices, iteration
-        evaluation = evaluate_samples(graph, samples, collect_fingerprint=False)
-        if evaluation.best_cost < best_cost:
-            best_cost = evaluation.best_cost
-            best_indices = evaluation.best_indices
+    def consume(samples: np.ndarray) -> None:
+        """Score one schedule's samples; update the incumbent."""
+        nonlocal best_cost, best_z, feasibility, iteration
+        z, cost, feas = evaluate_samples(scenario, qubo, samples)
+        if cost < best_cost:
+            best_cost = cost
+            best_z = z
+        feasibility = feas
         iteration += 1
-        history.append((iteration, best_cost))
         if on_progress is not None:
             on_progress(iteration, best_cost)
-        return evaluation.best_cost
-
-    # One Schrödinger evolution = 1/(bo_iters + 1) of the work (the +1 is
-    # the final high-statistics run). `evals_done` positions the heartbeat.
-    def evolve(schedule: AnnealSchedule, label: str, evals_done: int) -> np.ndarray:
-        assert sim is not None
-        if on_phase is None:
-            return sim.run(schedule, n_steps=n_steps)
-        emit_phase = on_phase
-
-        def heartbeat(step: int, total: int) -> None:
-            frac = (evals_done + step / total) / (bo_iters + 1)
-            emit_phase(
-                f"{label}: integrating {graph.n}-qubit dynamics, step {step}/{total}",
-                frac,
-            )
-
-        return sim.run(schedule, n_steps=n_steps, on_step=heartbeat)
 
     def objective(params: np.ndarray) -> float:
         schedule = AnnealSchedule(
@@ -461,18 +386,13 @@ def solve_pasqal_analog(
             delta_final=float(params[3]),
         )
         if use_pulser:
-            if on_phase is not None:
-                on_phase(
-                    f"BO eval {iteration + 1}/{bo_iters}: Pulser/QuTiP emulation",
-                    iteration / (bo_iters + 1),
-                )
-            samples = _pulser_sample(graph, schedule, shots=200)
+            samples = _pulser_sample(scenario, schedule, shots=200)
             consume(samples)
-            from .quantum_common import penalized_energy
-            return float(np.mean([penalized_energy(graph, s) for s in samples]))
-        assert sim is not None and energy_vec is not None
-        probs = evolve(schedule, f"BO eval {iteration + 1}/{bo_iters}", iteration)
-        consume(_sample_bits(probs, graph.n, 256, rng))
+            idx = (samples.astype(np.int64) << np.arange(scenario.n_vars)).sum(axis=1)
+            return float(energy_vec[idx].mean())
+        assert sim is not None
+        probs = sim.run(schedule, n_steps=n_steps)
+        consume(_sample_bits(probs, scenario.n_vars, 256, rng))
         # Exact expectation <E_penalty>: smooth, deterministic BO signal.
         return float(probs @ energy_vec)
 
@@ -491,46 +411,23 @@ def solve_pasqal_analog(
         delta_init=float(bo.x_best[2]),
         delta_final=float(bo.x_best[3]),
     )
-    # Time ONLY the final high-statistics evolution + sampling: this is the
-    # per-shot cost t_shot the TTS metric needs. The BO loop above is tuning
-    # overhead, reported separately (the gap between tts_sample and tts_total
-    # in the benchmark IS the BO cost).
-    t_sample0 = time.perf_counter()
     if use_pulser:
-        final_samples = _pulser_sample(graph, best_schedule, shots=n_shots)
+        final_samples = _pulser_sample(scenario, best_schedule, shots=n_shots)
     else:
         assert sim is not None
-        probs = evolve(best_schedule, "final sampling at the best schedule", bo_iters)
-        final_samples = _sample_bits(probs, graph.n, n_shots, rng)
-    final_sampling_wall_clock_s = time.perf_counter() - t_sample0
+        probs = sim.run(best_schedule, n_steps=n_steps)
+        final_samples = _sample_bits(probs, scenario.n_vars, n_shots, rng)
 
-    evaluation = evaluate_samples(graph, final_samples)
-    if evaluation.best_cost > best_cost:
-        # Keep the best incumbent found during BO probing.
-        evaluation.best_cost = best_cost
-        evaluation.best_indices = best_indices
-    history.append((iteration + 1, evaluation.best_cost))
+    z, cost, feas = evaluate_samples(scenario, qubo, final_samples)
+    if cost < best_cost:
+        best_cost = cost
+        best_z = z
 
-    return make_result(
+    return SolveResult(
         solver="pasqal-analog",
-        backend="pulser-qutip" if use_pulser else "statevector",
-        graph=graph,
-        evals=evals,
-        evaluation=evaluation,
+        best_z=best_z,
+        best_cost=best_cost,
+        feasibility_rate=feas,
+        n_samples=n_shots,
         wall_clock_s=time.perf_counter() - t0,
-        history=history,
-        meta={
-            "T_ns": round(best_schedule.T_ns, 1),
-            "omega_max_rad_us": round(best_schedule.omega_max, 3),
-            "delta_init_rad_us": round(best_schedule.delta_init, 3),
-            "delta_final_rad_us": round(best_schedule.delta_final, 3),
-            "U_blockade_rad_us": round(U_BLOCKADE, 2),
-            "n_qubits": graph.n,
-            "bo_iters": bo_iters,
-            "mean_penalized_energy": round(bo.y_best, 2),
-            "final_sampling_wall_clock_s": final_sampling_wall_clock_s,
-            "fingerprint": (
-                fingerprint_to_flat_dict(evaluation.fingerprint) if evaluation.fingerprint else {}
-            ),
-        },
     )
