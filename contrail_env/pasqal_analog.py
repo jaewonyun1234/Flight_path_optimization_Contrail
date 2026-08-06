@@ -45,11 +45,10 @@ import numpy as np
 from .bayes_opt import gp_minimize
 from .embedding_study import (
     MIN_ATOM_DISTANCE_UM,
-    check_embedding,
-    greedy_embedding,
+    embed,
     independence_edges,
 )
-from .exact import SolveResult, evaluate_samples
+from .exact import SolveResult, evaluate_samples, raw_metrics
 from .problem import Scenario
 from .qubo import QUBOInstance
 
@@ -250,18 +249,19 @@ def _sample_bits(probs: np.ndarray, n: int, shots: int, rng: np.random.Generator
 def unit_disk_register(scenario: Scenario) -> np.ndarray:
     """2D register layout for the scenario's independence graph.
 
-    Uses the shared greedy embedder (embedding_study.py, single source of
-    truth) and raises EmbeddingError when the result is not a valid
-    unit-disk placement — the common case for arbitrary conflict graphs;
-    the caller then falls back to the ideal-blockade statevector backend.
+    Uses the shared multi-start embedder (embedding_study.embed, single
+    source of truth: greedy init + force-directed refinement + seeded
+    restarts) and raises EmbeddingError when no restart produces a valid
+    unit-disk placement; the caller then falls back to the
+    ideal-blockade statevector backend.
     """
     edges = independence_edges(scenario)
-    coords = greedy_embedding(scenario.n_vars, edges)
-    report = check_embedding(coords, edges)
+    coords, report = embed(scenario.n_vars, edges)
     if not report.valid:
         raise EmbeddingError(
-            f"no valid unit-disk layout: {report.missing_edges} missing, "
-            f"{report.spurious_edges} spurious edge(s)"
+            f"no valid unit-disk layout after {report.n_restarts_used} restarts: "
+            f"{report.missing_edges} missing, {report.spurious_edges} spurious, "
+            f"{report.crowded_pairs} crowded pair(s)"
         )
     return coords
 
@@ -422,6 +422,7 @@ def solve_pasqal_analog(
     if cost < best_cost:
         best_cost = cost
         best_z = z
+    raw_best, raw_mean, _ = raw_metrics(final_samples, qubo)
 
     return SolveResult(
         solver="pasqal-analog",
@@ -430,4 +431,6 @@ def solve_pasqal_analog(
         feasibility_rate=feas,
         n_samples=n_shots,
         wall_clock_s=time.perf_counter() - t0,
+        raw_best_E=raw_best,
+        raw_mean_E=raw_mean,
     )

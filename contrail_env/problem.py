@@ -54,9 +54,13 @@ import numpy as np
 
 # Grid defaults: small on purpose. 8 columns x 8 rows is enough structure
 # for routes to cross inside blobs while staying easy to draw by hand.
+# Five blobs spanning 2-3 levels each, plus routes drawn from the central
+# rows, make conflict structure the NORM: with the old sparser defaults
+# (3 blobs, 1-2 levels, full-height routes) 3/20 seeds at F=4 had ZERO
+# conflicts — no puzzle to solve.
 N_X = 8
 N_Y = 8
-N_BLOBS = 3
+N_BLOBS = 5
 ALPHA = 10.0        # weight of one contrail cell relative to fuel units
 CLIMB_COST = 3.0    # fuel units per level away from the preferred level
 
@@ -104,8 +108,9 @@ def make_scenario(
 
     # --- 1. Routes: entry/exit rows per flight, rounded straight lines ----
     # routes[f, x] = grid row of flight f in column x (= time step x).
-    entry = rng.integers(0, N_Y, size=n_flights)
-    exit_ = rng.integers(0, N_Y, size=n_flights)
+    # Rows come from the central band [1, N_Y-2] so routes cross often.
+    entry = rng.integers(1, N_Y - 1, size=n_flights)
+    exit_ = rng.integers(1, N_Y - 1, size=n_flights)
     xs = np.arange(N_X)
     routes = np.rint(
         entry[:, None] + (exit_ - entry)[:, None] * xs[None, :] / (N_X - 1)
@@ -116,10 +121,10 @@ def make_scenario(
     for _ in range(n_blobs):
         x0 = int(rng.integers(0, N_X - 2))
         y0 = int(rng.integers(0, N_Y - 2))
-        x1 = min(N_X - 1, x0 + int(rng.integers(2, 4)))
+        x1 = min(N_X - 1, x0 + int(rng.integers(2, 5)))   # up to 4 columns wide
         y1 = min(N_Y - 1, y0 + int(rng.integers(2, 4)))
         k_lo = int(rng.integers(0, n_options))
-        k_hi = min(n_options - 1, k_lo + int(rng.integers(0, 2)))
+        k_hi = min(n_options - 1, k_lo + int(rng.integers(1, 3)))  # 2-3 levels
         blobs.append((x0, x1, y0, y1, k_lo, k_hi))
 
     def in_blob(x: int, y: int, k: int) -> bool:

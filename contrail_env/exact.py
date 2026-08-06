@@ -1,7 +1,7 @@
 """
-exact.py — Ground truth, null baseline, and metrics.
+exact.py — Ground truth, baselines, and metrics.
 
-Three jobs, all classical and all small:
+Four jobs, all classical and all small:
 
     1. brute_force_optimum : enumerate every bitstring, return the true
                              ground state of the QUBO. This is the exact
@@ -10,8 +10,11 @@ Three jobs, all classical and all small:
                              same repair as the quantum sampler — the
                              null control. If a sampler cannot beat this,
                              its structure is buying nothing.
-    3. metrics             : approximation ratio + feasibility rate,
-                             small pure functions, no classes.
+    3. solve_greedy        : the repair pass run ONCE on the all-zeros
+                             bitstring — the repair heuristic named as
+                             an honest competitor (see below).
+    4. metrics             : approximation ratio, raw-energy metrics,
+                             feasibility rate — small pure functions.
 
 REPAIR PIPELINE
 ===============
@@ -23,8 +26,16 @@ deterministic greedy pass, seeded by the sample:
     2. conflict : flights are finalized in cost order and never pick an
                   option that conflicts with an already-finalized one.
 
-Every solver reports the RAW feasibility rate (before repair) alongside
-the best repaired cost, so repair strength is visible, not hidden.
+RAW vs REPAIRED — which number to trust
+=======================================
+The repair pass IS a competent greedy heuristic: on easy instances it
+reaches the exact optimum from pure noise, so every solver ties at
+approx_ratio = 1.0 on repaired cost. Repaired cost therefore measures
+the PIPELINE, not the sampler. The sampler's own quality is its RAW
+QUBO energy E(z) over the unrepaired bitstrings (raw_metrics below) —
+that is the quantity it was asked to minimize and repair cannot game
+it. solve_greedy makes the hidden heuristic an explicitly named solver
+so "beats greedy" is a visible bar, not an accident of plumbing.
 """
 
 from __future__ import annotations
@@ -45,7 +56,12 @@ _CHUNK_BITS = 16  # enumerate in chunks of 2^16 rows to bound memory
 
 @dataclass
 class SolveResult:
-    """One solver's outcome on one scenario, in run.py's CSV shape."""
+    """One solver's outcome on one scenario, in run.py's CSV shape.
+
+    raw_best_E / raw_mean_E are QUBO energies of the UNREPAIRED samples
+    (the primary quality evidence — see module docstring); None for
+    solvers that draw no raw samples (brute force, greedy).
+    """
 
     solver: str
     best_z: np.ndarray
@@ -53,6 +69,8 @@ class SolveResult:
     feasibility_rate: float
     n_samples: int
     wall_clock_s: float
+    raw_best_E: float | None = None
+    raw_mean_E: float | None = None
 
 
 # =============================================================================
@@ -95,9 +113,13 @@ def brute_force_optimum(qubo: QUBOInstance) -> tuple[np.ndarray, float]:
 def repair(bits: np.ndarray, scenario: Scenario) -> np.ndarray:
     """Turn a raw sample into a feasible one-hot assignment (z vector).
 
-    Deterministic. Always restores one-hot; restores conflicts greedily
-    (a conflict can only survive if a flight has no compatible option
-    left, which would make the instance itself infeasible).
+    Deterministic. Always restores one-hot. Conflicts are restored
+    greedily, with a bounded retry: when a flight ends up blocked (every
+    option conflicts with an earlier pick), the whole pass reruns with
+    that flight promoted to the front of the order so it picks first.
+    A conflict can survive only if every retry fails — on dense graphs a
+    greedy order may miss an assignment that exists, so this is strong,
+    not complete.
     """
     costs = scenario.costs
     adjacency: dict[int, set[int]] = {i: set() for i in range(scenario.n_vars)}
@@ -115,12 +137,30 @@ def repair(bits: np.ndarray, scenario: Scenario) -> np.ndarray:
         queue.append((lead, f, sampled + rest))
     queue.sort(key=lambda item: (item[0], item[1]))
 
-    chosen: set[int] = set()
-    for _lead, _f, candidates in queue:
-        pick = next((c for c in candidates if not (adjacency[c] & chosen)), None)
-        if pick is None:  # no conflict-free option left; keep one-hot anyway
-            pick = candidates[0]
-        chosen.add(pick)
+    def one_pass(order: list[tuple[float, int, list[int]]]) -> tuple[set[int], int | None]:
+        """Greedy pass; returns (chosen, first blocked flight or None)."""
+        chosen: set[int] = set()
+        blocked: int | None = None
+        for _lead, f, candidates in order:
+            pick = next((c for c in candidates if not (adjacency[c] & chosen)), None)
+            if pick is None:  # no conflict-free option left; keep one-hot anyway
+                pick = candidates[0]
+                if blocked is None:
+                    blocked = f
+            chosen.add(pick)
+        return chosen, blocked
+
+    promoted: list[int] = []
+    chosen, blocked = one_pass(queue)
+    while blocked is not None and blocked not in promoted:
+        promoted.insert(0, blocked)
+        order = [item for f in promoted for item in queue if item[1] == f]
+        order += [item for item in queue if item[1] not in promoted]
+        attempt, attempt_blocked = one_pass(order)
+        if attempt_blocked is None:
+            chosen, blocked = attempt, None
+        else:
+            chosen, blocked = attempt, attempt_blocked
 
     z = np.zeros(scenario.n_vars, dtype=int)
     z[sorted(chosen)] = 1
@@ -138,12 +178,35 @@ def solve_random(
     rng = np.random.default_rng(seed)
     samples = (rng.random((n_samples, scenario.n_vars)) < 0.5).astype(np.uint8)
     best_z, best_cost, feas = evaluate_samples(scenario, qubo, samples)
+    raw_best, raw_mean, _ = raw_metrics(samples, qubo)
     return SolveResult(
         solver="random",
         best_z=best_z,
         best_cost=best_cost,
         feasibility_rate=feas,
         n_samples=n_samples,
+        wall_clock_s=time.perf_counter() - t0,
+        raw_best_E=raw_best,
+        raw_mean_E=raw_mean,
+    )
+
+
+def solve_greedy(scenario: Scenario, qubo: QUBOInstance) -> SolveResult:
+    """The repair heuristic itself, run once from a blank slate.
+
+    Repairing the all-zeros bitstring means "no option sampled anywhere":
+    the pass simply assigns every flight its cheapest conflict-free
+    option in cost order. Deterministic, no samples, no randomness —
+    the honest classical bar every sampler must clear.
+    """
+    t0 = time.perf_counter()
+    z = repair(np.zeros(scenario.n_vars, dtype=np.uint8), scenario)
+    return SolveResult(
+        solver="greedy",
+        best_z=z,
+        best_cost=float(np.dot(scenario.costs, z)),
+        feasibility_rate=1.0,
+        n_samples=1,
         wall_clock_s=time.perf_counter() - t0,
     )
 
@@ -177,6 +240,26 @@ def evaluate_samples(
 # =============================================================================
 # 3. METRICS — small pure functions
 # =============================================================================
+
+def raw_metrics(
+    samples: np.ndarray, qubo: QUBOInstance
+) -> tuple[float, float, float]:
+    """(best_raw_E, mean_raw_E, raw_feasibility) of UNREPAIRED samples.
+
+    Energies are full QUBO energies E(z) = z^T Q z + constant, penalties
+    included — exactly what the sampler is asked to minimize, and the one
+    number the repair step cannot game. This is the primary evidence of
+    sampler quality (see module docstring).
+    """
+    Z = np.asarray(samples, dtype=float)
+    energies = np.einsum("ij,ij->i", Z @ qubo.Q, Z) + qubo.constant
+    n_feasible = sum(1 for row in np.asarray(samples) if is_feasible(row, qubo)[0])
+    return (
+        float(energies.min()),
+        float(energies.mean()),
+        n_feasible / len(Z) if len(Z) else 0.0,
+    )
+
 
 def approximation_ratio(best_cost: float, e_min: float, e_rand_mean: float) -> float:
     """How much of the random-to-optimal gap did the solver close?
