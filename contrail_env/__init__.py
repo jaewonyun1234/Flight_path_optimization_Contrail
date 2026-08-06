@@ -10,8 +10,10 @@ from .bayes_opt import BOResult, gp_minimize
 from .embedding_study import (
     EmbeddingReport,
     check_embedding,
+    embed,
     greedy_embedding,
     independence_edges,
+    refine_embedding,
     run_embedding_study,
 )
 from .exact import (
@@ -41,8 +43,9 @@ __all__ = [
     "AnnealSchedule", "BOResult", "BackendBudgetError", "EmbeddingError",
     "EmbeddingReport", "QUBOInstance", "RydbergStatevector", "Scenario",
     "SolveResult", "approximation_ratio", "assemble_qubo", "brute_force_optimum",
-    "check_embedding", "cost_of_assignment", "evaluate_samples", "gp_minimize",
-    "greedy_embedding", "independence_edges", "is_feasible", "make_scenario",
+    "check_embedding", "cost_of_assignment", "embed", "evaluate_samples",
+    "gp_minimize", "greedy_embedding", "independence_edges", "is_feasible",
+    "make_scenario", "refine_embedding",
     "mean_random_cost", "node_weights", "pulser_available", "raw_metrics",
     "repair", "run_embedding_study", "solve_greedy", "solve_pasqal_analog",
     "solve_random",
