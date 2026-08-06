@@ -14,5 +14,10 @@ build/
 .mypy_cache/
 .ruff_cache/
 
-# Benchmark output
+# Local scratch / study notebooks
+playground/
+
+# Experiment output
 results.csv
+embedding.csv
+*.pdf

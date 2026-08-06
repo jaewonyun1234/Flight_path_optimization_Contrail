@@ -4,113 +4,52 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contrail-optimization"
-version = "0.1.0"
-description = "Contrail-aware flight-option optimizer: synthetic airspace environment + CP-SAT and quantum solvers, with a PyQt6 desktop client."
+version = "0.2.0"
+description = "Minimal contrail-aware flight-option QUBO: analog-QAOA + Bayesian optimization vs brute force and a random baseline."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "jaewonyun1234" }]
-keywords = ["optimization", "cp-sat", "contrails", "quantum", "pyqt6"]
+keywords = ["optimization", "qubo", "contrails", "quantum", "neutral-atoms"]
 
-# Core runtime = the environment + CP-SAT solver. The PyQt6 desktop dashboard
-# is in the `gui` extra so a headless install (tests / benchmark) stays lean.
 dependencies = [
     "numpy>=1.26",
-    "ortools>=9.10",
-    # scipy.sparse.linalg.eigsh (Lanczos) powers the analog-sweep spectrum
-    # (spectral.py) and the time-resolved dynamics diagnostics (dynamics.py).
-    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
-# PyQt6 desktop dashboard (client side only). Install with: pip install -e ".[gui]"
-gui = [
-    "PyQt6>=6.6",
-    "pyqtgraph>=0.13",
-    "PyOpenGL>=3.1",
-    # Geographic Map tab: Plotly draws a `geo` basemap (real country borders /
-    # coastlines, SVG so no WebGL, with bundled offline vectors) carrying the
-    # ISSR risk overlay + routes, shown in an embedded Chromium view (WebEngine).
-    "plotly>=5.24",
-    "PyQt6-WebEngine>=6.6",
-]
 dev = [
     "pytest>=8.0",
     "mypy>=1.8",
     "ruff>=0.4",
 ]
-# Real quantum SDK backends. The pipelines run WITHOUT these (built-in
-# statevector / exact-hafnian samplers); installing them switches
-# pasqal_analog to Pulser's QuTiP emulator and xanadu_gbs to Strawberry
-# Fields' gaussian backend automatically (backend="auto").
+# Optional real quantum SDK backend. The pipeline runs WITHOUT it (built-in
+# statevector simulator); installing it lets pasqal_analog use Pulser's
+# QuTiP emulator automatically (backend="auto") when the graph embeds.
 quantum = [
     "pulser>=0.21",
     "pulser-simulation>=0.21",
-    "strawberryfields>=0.23",
 ]
 
 [project.urls]
 Repository = "https://github.com/jaewonyun1234/Flight_path_optimization_Contrail"
 
-# ---------------------------------------------------------------------------
-# Packaging — contrail_env is the one installable package. The gui/ desktop
-# client is run directly (python gui/app.py), not installed.
-# ---------------------------------------------------------------------------
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["contrail_env*"]
 
-# ---------------------------------------------------------------------------
-# Ruff — the pre-existing `contrail_env` modules are treated as vendored source
-# (the brief forbids modifying them) and excluded; new code (the scenario
-# module, gui/, tests/) is linted normally.
-# ---------------------------------------------------------------------------
 [tool.ruff]
 line-length = 100
-extend-exclude = [
-    "playground",          # scratch / sandbox notebooks — not linted
-    "contrail_env/__init__.py",
-    "contrail_env/demo.py",
-    "contrail_env/units.py",
-    "contrail_env/synthetic_issr.py",
-    "contrail_env/airspace.py",
-    "contrail_env/world.py",
-    "contrail_env/aircraft.py",
-    "contrail_env/flight.py",
-    "contrail_env/options.py",
-    "contrail_env/qubo.py",
-    "playground",
-]
+extend-exclude = ["playground"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
 ignore = ["E501"]
 
-# ---------------------------------------------------------------------------
-# Mypy — fully type-check the new code (contrail_env.scenario, gui/). The
-# pre-existing env modules are vendored and not enforced.
-# ---------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = false
 exclude = ["build/"]
-
-# Pre-existing env modules are vendored (the brief forbids editing them), so
-# their best-effort type errors are not enforced.
-[[tool.mypy.overrides]]
-module = [
-    "contrail_env.units",
-    "contrail_env.synthetic_issr",
-    "contrail_env.airspace",
-    "contrail_env.world",
-    "contrail_env.aircraft",
-    "contrail_env.flight",
-    "contrail_env.options",
-    "contrail_env.qubo",
-    "contrail_env.demo",
-]
-ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
